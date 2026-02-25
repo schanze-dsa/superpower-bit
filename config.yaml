@@ -1,0 +1,394 @@
+# ============================================================
+# DFEM + PINN 总配置
+# - 本版：三种材料 jingmian / structural_steel / zhijia
+# - 弹性主模型：线弹性 + 预紧 + 接触/摩擦
+# - 额外保存了屈服强度、密度、热导率等，便于后处理
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. 材料库
+# ------------------------------------------------------------
+
+# 材料标签的枚举（顺序无所谓，但名字要和下面 material_properties 一致）
+material_enum:
+  - jingmian
+  - structural_steel
+  - zhijia
+
+# 各材料的属性。当前 DFEM 静力分析只会用到 E 和 nu，
+# 其它参数为后续屈服判定、动力学、热–结构耦合等做准备。
+material_properties:
+  jingmian:
+    # ---- 基本弹性参数（当前 DFEM 会用到）----
+    E: 6.9e4            # MPa，杨氏模量
+    nu: 0.33            # 泊松比
+
+    # 冗余弹性量（由 E, nu 推导，保留便于校验/扩展）
+    bulk_modulus: 6.7647e4    # MPa，体积模量 K
+    shear_modulus: 2.594e4    # MPa，剪切模量 G
+
+    # 密度与热学参数（后续若做动力学/热应力可用）
+    density: 2700.0           # kg/m^3
+    alpha_thermal: 2.4e-5     # 1/K，各向同性线膨胀系数
+    k_thermal: 166.9          # W/(m·K)，各向同性热导率
+    cp: 896.0                 # J/(kg·K)，比热容
+
+    # 强度参数（屈服/极限），可用于后处理安全系数或损伤指标
+    sigma_y_tension: 2.8e2        # MPa，拉伸屈服强度
+    sigma_y_compression: 2.8e2    # MPa，压缩屈服强度
+    sigma_u_tension: 3.1e2        # MPa，拉伸极限强度
+
+    # 如需疲劳分析，可在此增加 S–N 曲线数据
+    # sn_curve:
+    #   R: -1
+    #   points:
+    #     - [1.7e3, 2.75e8]
+    #     - [5.0e3, ...]
+    #     ...
+
+  structural_steel:
+    # ---- 基本弹性参数 ----
+    E: 2.0e5           # MPa，杨氏模量
+    nu: 0.30           # 泊松比
+
+    # 冗余弹性量
+    bulk_modulus: 1.6667e5    # MPa，体积模量 K
+    shear_modulus: 7.6923e4   # MPa，剪切模量 G
+
+    # 密度与热学参数
+    density: 7850.0           # kg/m^3
+    alpha_thermal: 1.2e-5     # 1/K
+    k_thermal: 60.5           # W/(m·K)
+    cp: 434.0                 # J/(kg·K)
+
+    # 强度参数
+    sigma_y_tension: 2.5e2        # MPa
+    sigma_y_compression: 2.5e2    # MPa
+    sigma_u_tension: 4.6e2        # MPa
+    hardening_modulus: 1.0e3      # MPa (linear isotropic hardening, conservative)
+
+  zhijia:
+    # ---- 基本弹性参数 ----
+    E: 7.42e4          # MPa，杨氏模量
+    nu: 0.36           # 泊松比
+
+    # 冗余弹性量
+    bulk_modulus: 8.8333e4    # MPa，体积模量 K
+    shear_modulus: 2.7279e4   # MPa，剪切模量 G
+
+    # 密度与热学参数
+    density: 2850.0           # kg/m^3
+    alpha_thermal: 2.38e-5    # 1/K
+    k_thermal: 44.0           # W/(m·K)
+    cp: 460.0                 # J/(kg·K)
+
+    # 强度参数
+    sigma_y_tension: 2.8e2        # MPa
+    sigma_y_compression: 2.8e2    # MPa
+    sigma_u_tension: 3.1e2        # MPa
+
+# ------------------------------------------------------------
+# 2. Part → 材料映射（需与 INP 中 Part 名一致）
+# ------------------------------------------------------------
+part2mat:
+  MIRROR: jingmian
+  'MIRROR UP': jingmian
+
+  LUOSHUAN: structural_steel
+  LUOSHUAN1: structural_steel
+  LUOSHUAN2: structural_steel
+  LUOMU:    structural_steel
+  LUOMU1:    structural_steel
+  LUOMU2:    structural_steel
+
+  AUTO1:  zhijia      # support parts
+
+# ------------------------------------------------------------
+# 3. 预紧螺栓与装配面
+# ------------------------------------------------------------
+nuts:
+  - name: nut
+    part: LUOMU
+  - name: nut1
+    part: LUOMU1
+  - name: nut2
+    part: LUOMU2
+
+
+# 预紧分阶段/顺序设置（enabled=true 则训练/推理都会按照顺序分步加载）
+preload_staging:
+  mode: force_then_lock
+  enabled: true              # 启用分阶段加载 -> PINN 输入包含顺序信息
+  randomize_order: false     # 固定顺序
+  repeat: 1                  # 固定 case
+  shuffle: false             # 若提供 sequence 列表，是否在 epoch 间随机打乱条目
+  jitter: 0.0                # 顺序列表在训练时叠加的 ±jitter 噪声（N）
+  relaxation: 0.25           # 顺序松弛系数；>0 时早拧的螺栓载荷放大、晚拧的减小
+  # sequence:               # 如需固定顺序，可取消注释并填写：
+  #   - values: [800, 600, 500]
+  #     order:  [1, 3, 2]    # 顺序字段支持 1-based 或 0-based
+
+preload_use_stages: true
+preload_randomize_order: false
+preload_sequence:
+  - values: [20.0, 20.0, 20.0]
+    order: [1, 2, 3]
+preload_sequence_repeat: 1
+preload_sequence_shuffle: false
+preload_sequence_jitter: 0.0
+
+# ------------------------------------------------------------
+# 4. 接触对设置（master/slave surface 名需与 INP 中一致）
+# ------------------------------------------------------------
+contact_pairs:
+  - master_key: GROUP_TARG_CONT_8_MASTER_COMP
+    slave_key: GROUP_TARG_CONT_8_SLAVE_COMP
+    name: contact_8
+
+
+# ------------------------------------------------------------
+# 4.5 边界条件（固定约束）
+# ------------------------------------------------------------
+# 默认使用 ALM 模式，以较低罚系数逼近硬约束；如需退回纯罚函数，可改为 penalty。
+bc_mode: alm            # alm | penalty | hard - 使用ALM避免高权重
+bc_alpha: 5.0e3         # 罚函数/ALM 基础刚度 (降低以配合低w_bc)
+bc_mu: 2.0e3            # ALM 增广系数 (提高以更强约束)
+
+# Tie约束配置（绑定约束）
+tie_mode: alm           # alm | penalty - 与BC保持一致使用ALM
+tie_alpha: 5.0e1        # Tie罚函数基础刚度 (再降低2倍，从1e2降到5e1)
+tie_mu: 2.0e2           # Tie ALM增广系数 (从5e2降到2e2)
+
+# ------------------------------------------------------------
+# 5. 网络与优化器配置（后续 DFEM 改造时会用）
+# ------------------------------------------------------------
+network_config:
+  model_type: pinn         # 保留兼容性
+  input_dim: 3             # P输入维度 (P1,P2,P3)
+  output_dim: 1            # 保留字段（实际由FieldConfig.out_dim控制）
+
+  # DFEM mode: use node embeddings instead of spatial coordinates
+  dfem_mode: false         # 关闭 DFEM 节点嵌入（回到 Fourier + GCN）；DFEM 能量积分仍由 ElasticityEnergy 提供
+  use_graph: false         # 关闭 kNN/GCN，使用纯 MLP 位移网络
+  n_nodes: null            # dfem_mode=true 时由 ElasticityEnergy 自动设置；dfem_mode=false 时忽略
+  node_emb_dim: 64         # dfem_mode=true 时使用；dfem_mode=false 时忽略
+  graph_precompute: false  # 纯 MLP 模式下无需预计算图邻接
+  graph_k: 8               # kNN 邻居数（提速用；固体力学通常够用）
+  graph_width: 128         # GCN 隐藏维度（提速）
+  graph_layers: 3          # GCN 层数（提速）
+
+  # 三类创新-1：网络架构创新（全MLP + 接触状态门控）
+  use_contact_gated_heads: true
+  contact_local_depth: 2
+  contact_gate_hidden: 64
+  contact_gate_temperature: 1.0
+  contact_residual_scale: 1.0
+  contact_gate_bias_init: -2.0
+  contact_max_centroids: 16
+  contact_context_enabled: true
+  contact_context_max_centroids: 16
+
+  layers:
+    - 64
+    - 64
+    - 32
+
+# ------------------------------------------------------------
+# 6. 后处理与可视化
+# ------------------------------------------------------------
+# 指定镜面表面名，用于镜面变形可视化与相关后处理；需与 INP 表面名完全匹配。
+mirror_surface_name: 'MIRROR UP'
+
+mixed_precision: null                     # null/false -> float32 (recommended if you see grad=nan); or "mixed_float16"
+
+optimizer_config:
+  type: Adam
+  learning_rate: 0.00001     # 从1e-4降到1e-5，防止DFEM初期NaN
+  grad_clip_norm: 1.0        # 从10降到1，加强裁剪防止梯度爆炸
+  batch_size: 32
+  epochs: 1500             # Adam 阶段的迭代步数
+  lbfgs:
+    enabled: false           # 是否在 Adam 之后追加 L-BFGS 精调
+    max_iter: 200            # L-BFGS 最大迭代次数
+    tolerance: 1.0e-6        # 收敛判据（目标函数相对变化）
+    history_size: 50         # 拟牛顿历史记忆对数
+    line_search: 50          # 线搜索最大迭代
+    reuse_last_batch: true   # true 表示复用 Adam 最后一次随机样本
+
+# ------------------------------------------------------------
+# 7. 弹性 DFEM 配置（ElasticityConfig）
+# ------------------------------------------------------------
+elasticity_config:
+  coord_scale: 1.0          # 坐标缩放系数
+  chunk_size: 0             # 节点前向微批大小；≤0 表示整图前向，不再分块
+  use_pfor: false           # 保留字段，可忽略
+  check_nan: true           # 是否进行数值 NaN 检查
+  n_points_per_step: 2048   # 每步用于 DFEM 积分的子单元/积分点上限；None/0 表示全量
+  plasticity_model: j2      # elastic | j2 (von Mises)
+
+# ------------------------------------------------------------
+# 7. 损失函数与自适应加权（TotalConfig + weighted PINN）
+# ------------------------------------------------------------
+loss_config:
+  mode: residual
+  base_weights:
+    # 策略：将所有项的加权后能量 (weighted energy) 统一控制在 1.0 ~ 10.0 左右
+
+    # DFEM节点嵌入随机初始化导致Eint爆炸，需要降低100倍
+    # Eint初始~1e6, 乘1e-7后约0.1，待稳定后可逐步提高
+    w_int: 0.0
+
+    # Ecn ~ 3e4, 乘 1e-4 后约 3.0 (接触很重要，稍微大点没关系)
+    w_cn: 1.0
+
+    # 【恢复摩擦】Ect ~ 5e7 (k_t降低后), 乘 1e-8 后约 0.5
+    # 摩擦是核心物理，必须保留！通过降低k_t来控制数值
+    w_ct: 0.0
+
+    # 三类创新-2：损失函数创新（互补约束 + 区域课程项）
+    w_fb: 1.0
+    w_region: 0.5
+
+    # 【禁用Tie约束】Etie完全冻结在1.001e+07，阻碍训练
+    # 暂时禁用，等修复后再启用
+    w_tie: 0.0        # 从1e-10改为0，完全禁用
+    w_bc: 1.0      # 边界条件通常残差较小，给大一点
+
+    # 【关键修复】预紧功不参与优化！它是输入载荷，不是目标
+    w_pre: 0.0     # preload work disabled
+    w_tight: 1.0   # nut tightening penalty
+
+    # 应力监督：用线弹性理论应力指导网络
+    # Esig ~ 1e7, 需要非常小的权重
+    w_sigma: 1.0   # 从1.0降到1e-4，防止主导损失
+    # 平衡残差：弱式 equilibrium (B^T * sigma_pred ≈ 0)，与应力头强耦合
+    w_eq: 1.0      # 先用与 w_sigma 同量级；如不稳可降到 1e-5
+
+    w_reg: 1.0e-4
+
+  adaptive:
+    # 暂时开启，但必须限制范围！防止它自动把 w_ct 调回 9.0 这种危险值
+    enabled: true
+    update_every: 50
+    ema_decay: 0.99
+    temperature: 1.0
+    min_weight: 1.0e-6   # ?????????
+    max_weight: 10.0     # residual-only ????
+    focus_terms:
+      - w_eq
+      - w_cn
+      - w_bc
+      # - w_ct
+      # 注意：预紧外功 W_pre 不参与自适应加权（避免等价“缩放载荷”）。
+      # 预紧项的权重会与 w_int 保持固定比例（由代码绑定），从而保持 P 的物理意义不变。
+
+  region_curriculum:
+    enabled: true
+    start: 0.20
+    end: 0.80
+    focus_power: 2.0
+    focus_sigma: 1.0
+
+# ------------------------------------------------------------
+# 4.4 接触力学参数 (Contact Mechanics Parameters)
+# ------------------------------------------------------------
+# 关键修复：降低摩擦惩罚系数k_t以匹配弹性能量scale
+# 当前问题：Ect=2.6e8远大于Eint=2.5e5，导致梯度NaN
+friction_config:
+  enabled: false
+  k_t: 0.0            # 关闭切向惩罚刚度
+  mu_t: 1.0e3         # 保留数值稳定系数（实际不会起作用）
+  mu_f: 0.0           # 关闭库仑摩擦
+  use_smooth_friction: false  # 关闭摩擦平滑路径
+  use_delta_st_friction: false
+  smooth_to_strict: false
+  smooth_fraction: 0.3
+  smooth_steps: 300
+  blend_steps: 200
+normal_config:
+  mode: "alm"
+  beta: 50.0          # 法向接触惩罚 (保持默认)
+  mu_n: 1.0e3         # 法向ALM系数
+  residual_mode: fb
+  fb_eps: 1.0e-8
+
+# ------------------------------------------------------------
+# 8. 输出与可视化
+# ------------------------------------------------------------
+output_config:
+  save_path: './results'
+  visualize: true
+  viz_use_shape_function_interp: true   # 启用形函数插值，让镜面云图更光滑
+  viz_surface_source: "part_top"
+  viz_refine_subdivisions: 2            # 细分以平滑
+  viz_diagnose_blanks: true             # 启用空白诊断
+  viz_auto_fill_blanks: true            # 自动填充小空洞
+  viz_draw_wireframe: false             # 不显示网格线
+  viz_write_surface_mesh: true
+# ------------------------------------------------------------
+# 9. INP 文件路径
+# ------------------------------------------------------------
+inp_path: C:/codex/mir111.cdb
+
+# ------------------------------------------------------------
+# 10. 训练采样/调度（main.py 会读取这些值覆盖默认兜底）
+# ------------------------------------------------------------
+debug_big_model: false             # 是否放大网络容量（默认关闭，避免无条件改模型尺寸）
+tighten_angle_min: 0.0            # tightening angle min (deg)
+tighten_angle_max: 30.0           # tightening angle max (deg)
+tightening_config:
+  alpha: 1.0e3
+  angle_unit: deg
+  clockwise: true
+
+n_contact_points_per_pair: 800      # 每对接触面的采样数（单阶段）
+tightening_n_points_each: 400     # samples per nut surface
+resample_contact_every: 50  # contact resample period (steps)
+
+# 三类创新-3：训练速度创新（多保真课程 + TTA 统计）
+speed_config:
+  multifidelity_enabled: true
+  coarse_fraction: 0.35
+  coarse_volume_ratio: 0.35
+  coarse_contact_ratio: 0.50
+  coarse_preload_ratio: 0.50
+  target_pen_ratio: 0.20
+
+alm_update_every: 0                # 交由阶段内 ALM 更新
+
+incremental_mode: true
+stage_inner_steps: 1
+stage_alm_every: 1
+stage_resample_contact: true
+reset_contact_state_per_case: true
+stage_schedule_steps: [400, 400, 400, 300]
+
+
+n_tie_points: 2000
+tie_alpha: 1e3
+
+# ------------------------------------------------------------
+# 11. Integration smoke profile (physics-only staged run)
+# ------------------------------------------------------------
+integration_smoke:
+  physics_only:
+    preload_use_stages: true
+    incremental_mode: true
+    seed: 42
+    viz_plot_stages: true
+    loss_config:
+      mode: residual
+      adaptive:
+        enabled: true
+        min_weight: 1.0e-6
+        max_weight: 10.0
+        focus_terms:
+          - w_cn
+          - w_eq
+          - w_bc
+    friction_config:
+      enabled: true
+      smooth_to_strict: true
+      off_fraction: 0.10
+      smooth_fraction: 0.30
+      blend_steps: 200
