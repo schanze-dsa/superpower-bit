@@ -1,0 +1,50 @@
+# IDE
+.idea/
+.vscode/
+
+# Python cache / tool caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv-wsl/
+venv/
+env/
+
+# Outputs
+checkpoints/
+results/
+outputs/
+temp_ckpt_test/
+
+# Logs
+*.log
+*.err
+
+# Local temp scripts / generated recovery artifacts
+temp_*.py
+src/model/loss_energy.cpython-*.py
+
+# Archives / exports
+*.zip
+mir.cdb
+
+# Local research artifacts (not part of source tree)
+notes/
+1-s2.0-S0045782525000593-main.pdf
+3D_Friction_Contact_PINN_ALM_Refactor_Checklist_v1.3.docx
+Residual_Only_PINN_Loss_Function_Design.docx
+Residual_Only_PINN_Loss_Function_Design.txt
+checklist_extract.txt
+network_arch_overview.txt
+network_arch_report.txt
+paper_extract.txt
+paper_extract_sec3.txt
+毕业论文V2.0.docx
+try.inp

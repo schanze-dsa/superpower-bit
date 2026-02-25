@@ -1,0 +1,672 @@
+# -*- coding: utf-8 -*-
+"""
+physics/preload_model.py
+
+从螺栓上下表面（来自 INP/Assembly 的 SurfaceDef 或现成点集）采样点云，
+并在训练时计算预紧功/位移差等统计量。
+
+关键点：
+  - _fetch_surface_points(): 优先调用 assembly.surfaces.get_surface_points()
+    自动把 SurfaceDef（ELEMENT 面）转换为 (X,N,w)。
+  - _coerce_surface_like_to_points(): 统一把多种“表面样式”落成点集，需要时利用 asm。
+  - energy(): 使用端面“轴向平均位移差”近似螺栓伸长量 Δ，并累加 W_pre = Σ P_i Δ_i；
+    其中 P_i 为螺栓预紧力(总力, N)，Δ 为长度量纲(与坐标单位一致)。
+  - _u_fn_chunked(): 对 u_fn 前向做 micro-batch，避免一次性大批量前向引起显存峰值。
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import tensorflow as tf
+
+from mesh.interp_utils import interp_bary_tf
+
+
+# ---------- 规格 ----------
+@dataclass
+class BoltSurfaceSpec:
+    name: str
+    up_key: str
+    down_key: Optional[str] = None
+    axis: Optional[Tuple[float, float, float]] = None  # optional bolt axis override (unit or non-unit)
+
+
+@dataclass
+class PreloadConfig:
+    epsilon: float = 1e-12     # 数值安全项
+    work_coeff: float = 1.0    # 预紧功系数，可按需要扩展
+    rank_relaxation: float = 0.0  # 顺序相关的松弛系数 (0 -> 不考虑顺序)
+    warn_on_missing_stress: bool = True   # warn if stress head missing in residual
+    error_on_missing_stress: bool = False # raise if stress head missing in residual
+    # 可选：前向分块大小（若未在 cfg 里设置，也可由 _u_fn_chunked 内部默认取 2048）
+    # forward_chunk: Optional[int] = None
+
+
+@dataclass
+class BoltSampleData:
+    name: str
+    # 上/下采样点与法向、权重（允许下侧缺省）
+    X_up: np.ndarray
+    N_up: np.ndarray
+    w_up: np.ndarray
+    up_node_idx: Optional[np.ndarray] = None   # (n,3) int32
+    up_bary: Optional[np.ndarray] = None       # (n,3) float32
+    X_dn: Optional[np.ndarray] = None
+    N_dn: Optional[np.ndarray] = None
+    w_dn: Optional[np.ndarray] = None
+    dn_node_idx: Optional[np.ndarray] = None   # (n,3) int32
+    dn_bary: Optional[np.ndarray] = None       # (n,3) float32
+    axis: Optional[np.ndarray] = None          # (3,) float32, unit axis for pretension
+
+
+def _compute_area_weights(tri_idx: np.ndarray, tri_areas: np.ndarray) -> np.ndarray:
+    """
+    Unbiased per-sample area weights for surface integration.
+
+    We sample triangles proportional to area; weighting each sample by (area / count)
+    yields unbiased estimates of surface integrals with reduced variance.
+    """
+    tri_idx = np.asarray(tri_idx, dtype=np.int64).reshape(-1)
+    tri_areas = np.asarray(tri_areas, dtype=np.float64).reshape(-1)
+    if tri_idx.size == 0 or tri_areas.size == 0:
+        return np.zeros((0,), dtype=np.float64)
+    counts = np.bincount(tri_idx, minlength=tri_areas.shape[0]).astype(np.float64)
+    w = tri_areas[tri_idx] / (counts[tri_idx] + 1e-16)
+    total_area = float(tri_areas.sum())
+    w_sum = float(w.sum())
+    if w_sum > 0:
+        w *= total_area / w_sum
+    return w
+
+
+def _sorted_node_ids(asm: Any) -> np.ndarray:
+    return np.asarray(sorted(int(nid) for nid in asm.nodes.keys()), dtype=np.int64)
+
+
+def _map_node_ids_to_idx(sorted_node_ids: np.ndarray, node_ids: np.ndarray) -> np.ndarray:
+    nid = np.asarray(node_ids, dtype=np.int64)
+    idx = np.searchsorted(sorted_node_ids, nid)
+    if idx.size == 0:
+        return idx.astype(np.int32)
+    bad = (
+        (idx < 0)
+        | (idx >= sorted_node_ids.shape[0])
+        | (sorted_node_ids[idx] != nid)
+    )
+    if np.any(bad):
+        missing = np.unique(nid[bad])[:10]
+        raise KeyError(f"Some node IDs are missing in asm.nodes (example: {missing}).")
+    return idx.astype(np.int32)
+
+
+def _weighted_centroid(X: np.ndarray, w: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64).reshape(-1, 3)
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    if X.size == 0 or w.size == 0:
+        return np.zeros((3,), dtype=np.float64)
+    wsum = float(np.sum(w)) + 1e-12
+    return (X * w[:, None]).sum(axis=0) / wsum
+
+
+def _normalize_axis(vec: np.ndarray) -> np.ndarray:
+    v = np.asarray(vec, dtype=np.float64).reshape(-1)
+    if v.size != 3:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    if not np.isfinite(n) or n < 1e-12:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return v / n
+
+
+# ---------- 辅助：把各种“表面样式”转为 (X,N,w) ----------
+def _coerce_surface_like_to_points(surface_like: Any,
+                                   n_points_each: Optional[int] = None,
+                                   asm: Any = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    将 surface_like 统一转为 (X, N, w)，需要时使用 asm（比如 SurfaceDef -> 元素面采样）。
+
+    支持：
+      - numpy.ndarray: 直接视为 X，N 取 z 轴，w=1
+      - SurfaceDef/具有 items/raw_lines 的对象：需要 asm，走 assembly.surfaces.surface_def_to_points()
+      - 带 to_points()/sample_points()/points 属性的方法对象：尝试调用得到 X/N/w
+    """
+    import numpy as _np
+
+    # 1) numpy 数组：直接当点集
+    if isinstance(surface_like, _np.ndarray):
+        X = _np.asarray(surface_like, dtype=_np.float32).reshape(-1, 3)
+        N = _np.zeros_like(X, dtype=_np.float32)
+        N[:, 2] = 1.0
+        w = _np.ones((X.shape[0],), dtype=_np.float32)
+        return X, N, w
+
+    # 2) SurfaceDef（或类似，带 items/raw_lines）
+    if surface_like is not None and (hasattr(surface_like, "items") or hasattr(surface_like, "raw_lines")):
+        if asm is None:
+            raise TypeError("SurfaceDef 转点需要 asm，但 asm=None。")
+        from assembly.surfaces import surface_def_to_points  # 延迟导入
+        X, N, w = surface_def_to_points(asm, surface_like, n_points_each or 1)
+        return X.astype(_np.float32), N.astype(_np.float32), w.astype(_np.float32)
+
+    # 3) 带方法的自定义类型
+    for attr in ("to_points", "sample_points", "points"):
+        if hasattr(surface_like, attr) and callable(getattr(surface_like, attr)):
+            out = getattr(surface_like, attr)()
+            # 允许返回 X 或 (X,N) 或 (X,N,w)
+            if isinstance(out, (list, tuple)):
+                if len(out) == 3:
+                    X, N, w = out
+                elif len(out) == 2:
+                    X, N = out
+                    w = _np.ones((X.shape[0],), dtype=_np.float32)
+                else:
+                    X = out[0]
+                    N = _np.zeros_like(X, dtype=_np.float32); N[:, 2] = 1.0
+                    w = _np.ones((X.shape[0],), dtype=_np.float32)
+            else:
+                X = _np.asarray(out, dtype=_np.float32)
+                N = _np.zeros_like(X, dtype=_np.float32); N[:, 2] = 1.0
+                w = _np.ones((X.shape[0],), dtype=_np.float32)
+            return X.astype(_np.float32), N.astype(_np.float32), w.astype(_np.float32)
+
+    # 4) 都不匹配
+    tname = type(surface_like).__name__
+    raise TypeError(f"无法把对象类型 {tname} 转为表面点集。请提供 ndarray/SurfaceDef/可 to_points 的对象。")
+
+
+class PreloadWork:
+    def __init__(self, cfg: Optional[PreloadConfig] = None):
+        self.cfg = cfg or PreloadConfig()
+        self._bolts: List[BoltSampleData] = []
+        self._warned_missing_stress: bool = False
+
+    # --------- 构建 ---------
+    def build_from_specs(self, asm, specs: List[BoltSurfaceSpec],
+                         n_points_each: int = 800, seed: int = 0) -> None:
+        """
+        从装配的 surfaces 中根据 specs 采样出每个螺栓的上/下表面点集合。
+        保留用户在 INP 中的原始键名（包括 'bolt2 uo' 这样的笔误），不做重命名。
+        """
+        rng = np.random.default_rng(seed)
+        bolts: List[BoltSampleData] = []
+        for sp in specs:
+            X_up, N_up, w_up, up_node_idx, up_bary = self._fetch_surface_points_with_interp(
+                asm, sp.up_key, n_points_each, rng
+            )
+            X_dn = N_dn = w_dn = dn_node_idx = dn_bary = None
+            if sp.down_key:
+                X_dn, N_dn, w_dn, dn_node_idx, dn_bary = self._fetch_surface_points_with_interp(
+                    asm, sp.down_key, n_points_each, rng
+                )
+
+            # 打乱（可选）
+            idx = rng.permutation(X_up.shape[0])
+            X_up, N_up, w_up = X_up[idx], N_up[idx], w_up[idx]
+            if up_node_idx is not None:
+                up_node_idx = up_node_idx[idx]
+            if up_bary is not None:
+                up_bary = up_bary[idx]
+            if X_dn is not None:
+                idy = rng.permutation(X_dn.shape[0])
+                X_dn, N_dn, w_dn = X_dn[idy], N_dn[idy], w_dn[idy]
+                if dn_node_idx is not None:
+                    dn_node_idx = dn_node_idx[idy]
+                if dn_bary is not None:
+                    dn_bary = dn_bary[idy]
+
+            axis_vec = None
+            if getattr(sp, "axis", None) is not None:
+                axis_vec = _normalize_axis(np.asarray(sp.axis, dtype=np.float64))
+            elif X_dn is not None:
+                c_up = _weighted_centroid(X_up, w_up)
+                c_dn = _weighted_centroid(X_dn, w_dn)
+                axis_vec = _normalize_axis(c_up - c_dn)
+            else:
+                a_guess = _weighted_centroid(N_up, w_up)
+                axis_vec = _normalize_axis(a_guess)
+
+            bolts.append(BoltSampleData(
+                name=sp.name,
+                X_up=X_up.astype(np.float32), N_up=N_up.astype(np.float32), w_up=w_up.astype(np.float32),
+                up_node_idx=None if up_node_idx is None else up_node_idx.astype(np.int32),
+                up_bary=None if up_bary is None else up_bary.astype(np.float32),
+                X_dn=None if X_dn is None else X_dn.astype(np.float32),
+                N_dn=None if N_dn is None else N_dn.astype(np.float32),
+                w_dn=None if w_dn is None else w_dn.astype(np.float32),
+                dn_node_idx=None if dn_node_idx is None else dn_node_idx.astype(np.int32),
+                dn_bary=None if dn_bary is None else dn_bary.astype(np.float32),
+                axis=axis_vec.astype(np.float32) if axis_vec is not None else None,
+            ))
+        self._bolts = bolts
+
+    # --------- 采样辅助 ---------
+    def _fetch_surface_points_with_interp(
+        self,
+        asm: Any,
+        key: str,
+        n_points_each: int,
+        rng: np.random.Generator,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Try triangulation-based sampling so we can return barycentric interpolation metadata.
+
+        Returns: (X, N, w, tri_node_idx, bary)
+        If triangulation fails (e.g., NODE surfaces), falls back to the legacy point sampler
+        and returns (X, N, w, None, None).
+        """
+        try:
+            from mesh.surface_utils import (
+                resolve_surface_to_tris,
+                compute_tri_geometry,
+                sample_points_on_surface,
+            )
+
+            ts = resolve_surface_to_tris(asm, key)
+            provider = asm.parts[ts.part_name] if getattr(ts, "part_name", None) in getattr(asm, "parts", {}) else asm
+
+            X, tri_idx, bary, N = sample_points_on_surface(provider, ts, n_points_each, rng=rng)
+            tri_areas, _, _ = compute_tri_geometry(provider, ts)
+            w = _compute_area_weights(tri_idx, tri_areas)
+
+            sorted_node_ids = _sorted_node_ids(asm)
+            tri_node_ids = ts.tri_node_ids[tri_idx.astype(np.int64)]
+            tri_node_idx = _map_node_ids_to_idx(sorted_node_ids, tri_node_ids)
+            return (
+                X.astype(np.float32),
+                N.astype(np.float32),
+                w.astype(np.float32),
+                tri_node_idx.astype(np.int32),
+                bary.astype(np.float32),
+            )
+        except Exception:
+            X, N, w = self._fetch_surface_points(asm, key, n_points_each)
+            return X, N, w, None, None
+
+    def _fetch_surface_points(self, asm, key: str, n_points_each: int
+                              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        统一返回 (X, N, w)，均为 float32。
+
+        优先级：
+          1) assembly.surfaces.get_surface_points(asm, key, n)  -> (X,N,w)
+          2) asm.surfaces[key] 存在：交给 _coerce_surface_like_to_points(..., asm=asm)
+          3) asm.get_surface_points(key, n) 兜底
+        """
+        # 1) 首选高层入口
+        try:
+            from assembly.surfaces import get_surface_points as _get_pts
+            X, N, w = _get_pts(asm, key, n_points_each)
+            return X.astype(np.float32), N.astype(np.float32), w.astype(np.float32)
+        except Exception:
+            pass  # 继续向下兜底
+
+        # 2) 直接从映射取
+        mp = getattr(asm, "surfaces", None) or getattr(asm, "surface_map", None) or {}
+        if isinstance(mp, dict) and key in mp:
+            val = mp[key]
+            X, N, w = _coerce_surface_like_to_points(val, n_points_each, asm)  # <<< 接受 asm
+            return X.astype(np.float32), N.astype(np.float32), w.astype(np.float32)
+
+        # 3) 兜底：装配自带方法
+        if hasattr(asm, "get_surface_points") and callable(getattr(asm, "get_surface_points")):
+            out = asm.get_surface_points(key, n_points_each)
+            if isinstance(out, (list, tuple)):
+                if len(out) == 3:
+                    X, N, w = out
+                elif len(out) == 2:
+                    X, N = out
+                    w = np.ones((X.shape[0],), dtype=np.float32)
+                else:
+                    X = out[0]
+                    N = np.zeros_like(X, dtype=np.float32); N[:, 2] = 1.0
+                    w = np.ones((X.shape[0],), dtype=np.float32)
+            else:
+                X = np.asarray(out, dtype=np.float32)
+                N = np.zeros_like(X, dtype=np.float32); N[:, 2] = 1.0
+                w = np.ones((X.shape[0],), dtype=np.float32)
+            return X.astype(np.float32), N.astype(np.float32), w.astype(np.float32)
+
+        # 4) 失败
+        raise KeyError(f"[PreloadWork] 找不到表面 '{key}' 的点集。"
+                       f" 请检查 asm.surfaces / assembly.surfaces.get_surface_points / asm.get_surface_points。")
+
+    # --------- 前向分块（避免显存峰值） ---------
+    def _u_fn_chunked(self, u_fn, params, X, batch: int = None) -> tf.Tensor:
+        """
+        对大批量坐标 X 分块调用位移网络 u_fn，避免一次性前向造成显存峰值。
+        - u_fn: 形如 u_fn(X, params) -> (N,3)
+        - params: 训练时传入的额外参数（如预紧力编码）
+        - X: (N,3) 张量或 ndarray；允许已是 float16/float32 Tensor
+        - batch: 每个 micro-batch 的大小；None 时使用 cfg.forward_chunk 或 2048
+        返回: (N,3) 与输入顺序一致的拼接结果（float32）
+        """
+        if batch is None:
+            batch = int(getattr(self.cfg, "forward_chunk", 2048))
+        batch = max(1, int(batch))
+
+        # 注意：若 X 已是 Tensor 且 dtype=fp16，tf.convert_to_tensor(..., dtype=fp32) 会报错；
+        # 正确做法是先 convert，再显式 cast。
+        X = tf.convert_to_tensor(X)
+        if X.dtype != tf.float32:
+            X = tf.cast(X, tf.float32)
+
+        n = int(X.shape[0])
+
+        outs = []
+        for s in range(0, n, batch):
+            e = min(n, s + batch)
+            Xi = X[s:e]                   # (m,3) float32
+            Ui = u_fn(Xi, params)         # (m,3)（网络内部可用混合精度）
+            outs.append(tf.cast(Ui, tf.float32))
+        return tf.concat(outs, axis=0)    # (N,3) float32
+
+    def _us_fn_chunked(self, us_fn, params, X, batch: int = None) -> tf.Tensor:
+        """
+        对大批量坐标 X 分块调用应力头 us_fn，返回 sigma。
+        - us_fn: 形如 us_fn(X, params) -> (u, sigma)
+        - 返回: (N,6) sigma（float32）
+        """
+        if batch is None:
+            batch = int(getattr(self.cfg, "forward_chunk", 2048))
+        batch = max(1, int(batch))
+
+        X = tf.convert_to_tensor(X)
+        if X.dtype != tf.float32:
+            X = tf.cast(X, tf.float32)
+
+        n = int(X.shape[0])
+        outs = []
+        for s in range(0, n, batch):
+            e = min(n, s + batch)
+            Xi = X[s:e]
+            _, si = us_fn(Xi, params)
+            outs.append(tf.cast(si, tf.float32))
+        return tf.concat(outs, axis=0)
+
+    # --------- 物理量计算 ---------
+    def _bolt_delta(
+        self,
+        u_fn,
+        params,
+        bolt: BoltSampleData,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+    ) -> tf.Tensor:
+        """
+        计算单个螺栓端面的“轴向相对位移差”(近似螺栓伸长量)：
+
+            Δ = mean_A( u_up · a ) - mean_A( u_dn · a )
+
+        其中 a 为螺栓轴向单位向量(由上端面法向的面积加权平均近似)。
+
+        注意：这里使用“位移”而非 “(X+u)” 的绝对位置，确保 u=0 时 Δ=0，
+        且当 P_i 被解释为预紧力(总力, N)时，W_pre = P·Δ 的量纲为能量(力×位移)。
+
+        若无下侧端面，则退化为 Δ = mean_A(u_up·a)。
+        """
+        # 预紧功/位移差属于“物理量统计”，这里强制使用 float32，避免 mixed_float16 下的数值误差
+        dtype = tf.float32
+        eps = tf.cast(getattr(self.cfg, "epsilon", 1e-12), dtype)
+
+        # 上侧
+        X_up = tf.cast(tf.convert_to_tensor(bolt.X_up), dtype)  # (m,3)
+        N_up = tf.cast(tf.convert_to_tensor(bolt.N_up), dtype)  # (m,3)
+        w_up = tf.cast(tf.convert_to_tensor(bolt.w_up), dtype)  # (m,)
+        u_up = None
+        if u_nodes is not None and bolt.up_node_idx is not None and bolt.up_bary is not None:
+            u_up = interp_bary_tf(
+                tf.cast(u_nodes, dtype),
+                tf.convert_to_tensor(bolt.up_node_idx, dtype=tf.int32),
+                tf.convert_to_tensor(bolt.up_bary, dtype=dtype),
+            )
+        else:
+            u_up = self._u_fn_chunked(
+                u_fn, params, X_up, batch=int(getattr(self.cfg, "forward_chunk", 2048))
+            )  # (m,3)
+        # 轴向单位向量 a：优先使用预计算轴向（更接近 ANSYS 的 pretension 轴）
+        wsum_up = tf.reduce_sum(w_up) + eps
+        if bolt.axis is not None:
+            a = tf.cast(tf.convert_to_tensor(bolt.axis), dtype)
+            a = a / (tf.norm(a) + eps)
+        else:
+            a = tf.reduce_sum(N_up * w_up[:, None], axis=0) / wsum_up
+            a = a / (tf.norm(a) + eps)  # (3,)
+
+        uax_up = tf.reduce_sum(u_up * a[None, :], axis=1)              # (m,)
+        mean_up = tf.reduce_sum(uax_up * w_up) / wsum_up               # scalar
+
+        if bolt.X_dn is None:
+            return tf.cast(mean_up, tf.float32)
+
+        # 下侧
+        X_dn = tf.cast(tf.convert_to_tensor(bolt.X_dn), dtype)
+        w_dn = tf.cast(tf.convert_to_tensor(bolt.w_dn), dtype)
+        u_dn = None
+        if u_nodes is not None and bolt.dn_node_idx is not None and bolt.dn_bary is not None:
+            u_dn = interp_bary_tf(
+                tf.cast(u_nodes, dtype),
+                tf.convert_to_tensor(bolt.dn_node_idx, dtype=tf.int32),
+                tf.convert_to_tensor(bolt.dn_bary, dtype=dtype),
+            )
+        else:
+            u_dn = self._u_fn_chunked(
+                u_fn, params, X_dn, batch=int(getattr(self.cfg, "forward_chunk", 2048))
+            )  # (m,3)
+        wsum_dn = tf.reduce_sum(w_dn) + eps
+        uax_dn = tf.reduce_sum(u_dn * a[None, :], axis=1)
+        mean_dn = tf.reduce_sum(uax_dn * w_dn) / wsum_dn
+
+        return tf.cast(mean_up - mean_dn, tf.float32)
+
+    def _bolt_axial_force(
+        self,
+        us_fn,
+        params,
+        bolt: BoltSampleData,
+        *,
+        use_down: bool = False,
+    ) -> tf.Tensor:
+        """
+        Approximate axial resultant force on a bolt end face:
+            F_b = ∫ (sigma · n) · a dA
+
+        Stress head ordering assumed: [xx, yy, zz, xy, yz, xz].
+        """
+        # Use up face by default; fall back to down face if requested/available.
+        if use_down and bolt.X_dn is not None:
+            X = tf.cast(tf.convert_to_tensor(bolt.X_dn), tf.float32)
+            N = tf.cast(tf.convert_to_tensor(bolt.N_dn), tf.float32)
+            w = tf.cast(tf.convert_to_tensor(bolt.w_dn), tf.float32)
+        else:
+            X = tf.cast(tf.convert_to_tensor(bolt.X_up), tf.float32)
+            N = tf.cast(tf.convert_to_tensor(bolt.N_up), tf.float32)
+            w = tf.cast(tf.convert_to_tensor(bolt.w_up), tf.float32)
+
+        sigma = self._us_fn_chunked(us_fn, params, X)  # (m,6)
+        sigma = sigma[:, :6]
+        sxx, syy, szz, sxy, syz, sxz = tf.unstack(sigma, axis=1)
+        nx, ny, nz = tf.unstack(N, axis=1)
+        # traction = sigma · n
+        tx = sxx * nx + sxy * ny + sxz * nz
+        ty = sxy * nx + syy * ny + syz * nz
+        tz = sxz * nx + syz * ny + szz * nz
+        t = tf.stack([tx, ty, tz], axis=1)
+
+        if bolt.axis is not None:
+            a = tf.cast(tf.convert_to_tensor(bolt.axis), tf.float32)
+        else:
+            wsum = tf.reduce_sum(w) + tf.cast(1e-12, tf.float32)
+            a = tf.reduce_sum(N * w[:, None], axis=0) / wsum
+        a = a / (tf.norm(a) + 1e-12)
+
+        f = tf.reduce_sum(w * tf.reduce_sum(t * a[None, :], axis=1))
+        return tf.cast(f, tf.float32)
+
+    def energy(self, u_fn, params: Dict[str, tf.Tensor], *, u_nodes: Optional[tf.Tensor] = None):
+        """
+        预紧功近似：W_pre = Σ_i  P_i * Δ_i
+        其中 P_i 来自 params["P"] (shape=(3,))，Δ_i 来自 _bolt_delta。
+        返回 (W_pre, stats)；stats 里附带每个 bolt 的 Δ。
+        """
+        if not self._bolts:
+            zero = tf.constant(0.0, dtype=tf.float32)
+            return zero, {"preload": {"bolt_deltas": tf.zeros((0,), tf.float32)}}
+
+        P = tf.convert_to_tensor(params.get("P", [0.0, 0.0, 0.0]), dtype=tf.float32)  # (3,)
+        nb = len(self._bolts)
+        nb_tf = tf.constant(nb, dtype=tf.int32)
+        # 截断/补零到 nb（保持在图模式下使用张量逻辑，避免 Python 布尔比较）
+        p_len = tf.shape(P)[0]
+
+        def _pad():
+            pad = nb_tf - p_len
+            zeros = tf.zeros((pad,), dtype=tf.float32)
+            return tf.concat([P, zeros], axis=0)
+
+        def _truncate():
+            return P[:nb]
+
+        P = tf.cond(p_len < nb_tf, _pad, _truncate)
+        P = P[:nb]
+
+        stage_rank = params.get("stage_rank", None)
+        if stage_rank is not None:
+            rank_vec = tf.convert_to_tensor(stage_rank, dtype=tf.float32)
+            rank_vec = rank_vec[:nb]
+            relax = float(getattr(self.cfg, "rank_relaxation", 0.0) or 0.0)
+            if relax != 0.0:
+                if nb > 1:
+                    coeff = tf.constant(relax, dtype=tf.float32)
+                    center = tf.constant(0.5, dtype=tf.float32)
+                    scale = 1.0 + coeff * (center - rank_vec)
+                else:
+                    scale = tf.ones_like(rank_vec)
+                P = P * scale
+
+        deltas = []
+        for bolt in self._bolts:
+            di = self._bolt_delta(u_fn, params, bolt, u_nodes=u_nodes)   # 标量
+            deltas.append(di)
+        delta_vec = tf.stack(deltas, axis=0)            # (nb,)
+
+        W_pre = tf.reduce_sum(P[:nb] * delta_vec) * tf.constant(self.cfg.work_coeff, dtype=tf.float32)
+        stats = {"preload": {"bolt_deltas": delta_vec}}
+        return W_pre, stats
+
+    def residual(
+        self,
+        u_fn,
+        params: Dict[str, tf.Tensor],
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+        stress_fn=None,
+    ):
+        """
+        Residual-only preload term.
+
+        Prefer axial force residual (requires stress head):
+            r_pre,b = (F_b - P_b^target) / P_ref
+        Falls back to zero if stress_fn is not available.
+        """
+        if not self._bolts:
+            zero = tf.constant(0.0, dtype=tf.float32)
+            return zero, {"preload": {"bolt_deltas": tf.zeros((0,), tf.float32)}}
+
+        P = tf.convert_to_tensor(params.get("P", [0.0, 0.0, 0.0]), dtype=tf.float32)
+        nb = len(self._bolts)
+        nb_tf = tf.constant(nb, dtype=tf.int32)
+        p_len = tf.shape(P)[0]
+
+        def _pad():
+            pad = nb_tf - p_len
+            zeros = tf.zeros((pad,), dtype=tf.float32)
+            return tf.concat([P, zeros], axis=0)
+
+        def _truncate():
+            return P[:nb]
+
+        P = tf.cond(p_len < nb_tf, _pad, _truncate)
+        P = P[:nb]
+
+        stage_rank = params.get("stage_rank", None)
+        if stage_rank is not None:
+            rank_vec = tf.convert_to_tensor(stage_rank, dtype=tf.float32)
+            rank_vec = rank_vec[:nb]
+            relax = float(getattr(self.cfg, "rank_relaxation", 0.0) or 0.0)
+            if relax != 0.0:
+                if nb > 1:
+                    coeff = tf.constant(relax, dtype=tf.float32)
+                    center = tf.constant(0.5, dtype=tf.float32)
+                    scale = 1.0 + coeff * (center - rank_vec)
+                else:
+                    scale = tf.ones_like(rank_vec)
+                P = P * scale
+
+        stage_last = params.get("stage_last", None)
+        if stage_last is not None:
+            last_vec = tf.convert_to_tensor(stage_last, dtype=tf.float32)
+            last_len = tf.shape(last_vec)[0]
+
+            def _pad_last():
+                pad = nb_tf - last_len
+                zeros = tf.zeros((pad,), dtype=tf.float32)
+                return tf.concat([last_vec, zeros], axis=0)
+
+            def _truncate_last():
+                return last_vec[:nb]
+
+            last_vec = tf.cond(last_len < nb_tf, _pad_last, _truncate_last)
+            last_vec = last_vec[:nb]
+        else:
+            last_vec = tf.ones((nb,), dtype=tf.float32)
+
+        # Always compute bolt_deltas for force-then-lock usage.
+        deltas = []
+        for bolt in self._bolts:
+            di = self._bolt_delta(u_fn, params, bolt, u_nodes=u_nodes)
+            deltas.append(di)
+        delta_vec = tf.stack(deltas, axis=0)
+        stats = {"preload": {"bolt_deltas": delta_vec}}
+        if stage_last is not None:
+            stats["preload"]["stage_last"] = last_vec
+
+        if stress_fn is None:
+            if self.cfg.warn_on_missing_stress or self.cfg.error_on_missing_stress:
+                pmax = None
+                if tf.executing_eagerly():
+                    try:
+                        pmax = float(tf.reduce_max(tf.abs(P[:nb])).numpy())
+                    except Exception:
+                        pmax = None
+                has_load = (pmax is None) or (pmax > 0.0)
+                if has_load:
+                    if self.cfg.error_on_missing_stress:
+                        raise RuntimeError(
+                            "[PreloadWork] residual() requires stress_fn to compute axial force. "
+                            "Enable the stress head (stress_out_dim=6) or disable w_pre."
+                        )
+                    if self.cfg.warn_on_missing_stress and not self._warned_missing_stress:
+                        print(
+                            "[PreloadWork] WARNING: stress_fn is None; preload residual is disabled "
+                            "(L_pre=0). Enable stress_out_dim=6 or set w_pre=0."
+                        )
+                        self._warned_missing_stress = True
+            return tf.constant(0.0, dtype=tf.float32), stats
+
+        forces = []
+        for bolt in self._bolts:
+            fi = self._bolt_axial_force(stress_fn, params, bolt)
+            forces.append(fi)
+        force_vec = tf.stack(forces, axis=0)
+        stats["preload"]["bolt_forces"] = force_vec
+
+        active_P = tf.cast(P[:nb], tf.float32) * tf.cast(last_vec, tf.float32)
+        P_ref = tf.maximum(tf.reduce_max(tf.abs(active_P)), tf.constant(1.0, dtype=tf.float32))
+        r_pre = (force_vec - tf.cast(P[:nb], tf.float32)) / P_ref
+        r_pre = r_pre * tf.cast(last_vec, tf.float32)
+        denom = tf.reduce_sum(tf.cast(last_vec, tf.float32)) + tf.constant(1e-12, dtype=tf.float32)
+        L_pre = tf.reduce_sum(r_pre * r_pre) / denom
+        stats["preload"]["preload_rms"] = tf.sqrt(tf.reduce_mean(r_pre * r_pre) + 1e-12)
+        return L_pre, stats
