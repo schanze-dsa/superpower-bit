@@ -84,7 +84,7 @@ from physics.tie_constraints import TiePenalty, TieConfig
 from physics.tightening_model import NutTighteningPenalty, TighteningConfig, NutSpec
 from model.loss_energy import TotalEnergy, TotalConfig
 from train.loss_weights import LossWeightState, update_loss_weights, combine_loss
-from viz.mirror_viz import plot_mirror_deflection_by_name
+from viz.mirror_viz import make_mirror_export_filename, plot_mirror_deflection_by_name
 
 
 # ----------------- 配置 -----------------
@@ -3373,10 +3373,17 @@ class Trainer:
         return export_dir
 
     # ----------------- 可视化（鲁棒多签名） -----------------
-    def _call_viz(self, P: np.ndarray, params: Dict[str, tf.Tensor], out_path: str, title: str):
+    def _call_viz(
+        self,
+        P: np.ndarray,
+        params: Dict[str, tf.Tensor],
+        out_path: str,
+        title: str,
+        force_write_data: bool = False,
+    ):
         bare = self.cfg.mirror_surface_name
         data_path = None
-        if self.cfg.viz_write_data and out_path:
+        if (self.cfg.viz_write_data or force_write_data) and out_path:
             data_path = os.path.splitext(out_path)[0] + ".txt"
 
         mesh_path = None
@@ -3491,10 +3498,13 @@ class Trainer:
             title = f"{self.cfg.viz_title_prefix}  theta=[{angle_txt}]{unit}"
             if order_display:
                 title += f"  (order={order_display})"
-            suffix = f"_{order_display.replace('-', '')}" if order_display else ""
-            save_path = os.path.join(
-                self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}.png"
+            order_arr = preload_case.get("order") if isinstance(preload_case, dict) else None
+            save_name = make_mirror_export_filename(
+                kind="final",
+                case_index=i + 1,
+                order=order_arr,
             )
+            save_path = os.path.join(self.cfg.out_dir, save_name)
             params_full = self._make_preload_params(preload_case)
             params_eval = self._extract_final_stage_params(params_full, keep_context=True)
 
@@ -3530,7 +3540,13 @@ class Trainer:
                 except Exception as exc:
                     print(f"[viz] tightening report skipped: {exc}")
             try:
-                _, _, data_path = self._call_viz(P, params_eval, save_path, title)
+                _, _, data_path = self._call_viz(
+                    P,
+                    params_eval,
+                    save_path,
+                    title,
+                    force_write_data=True,
+                )
                 if self.cfg.viz_surface_enabled:
                     if not os.path.exists(save_path):
                         try:
@@ -3581,11 +3597,21 @@ class Trainer:
                             if order_display:
                                 title_s += f"  (order={order_display})"
                             title_s += f"  (stage={s+1}/{int(stages_np.shape[0])})"
-                            save_path_s = os.path.join(
-                                self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}_s{s+1}.png"
+                            save_name_s = make_mirror_export_filename(
+                                kind="stage",
+                                stage_index=s + 1,
+                                case_index=i + 1,
+                                order=order_arr,
                             )
+                            save_path_s = os.path.join(self.cfg.out_dir, save_name_s)
                             params_s = self._extract_stage_params(params_full, s, keep_context=True)
-                            self._call_viz(P_stage, params_s, save_path_s, title_s)
+                            self._call_viz(
+                                P_stage,
+                                params_s,
+                                save_path_s,
+                                title_s,
+                                force_write_data=True,
+                            )
                 except Exception as exc:
                     print(f"[viz] stage plots skipped: {exc}")
 
