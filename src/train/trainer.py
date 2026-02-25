@@ -17,6 +17,7 @@ import copy
 import re
 import math
 import shutil
+import itertools
 from dataclasses import dataclass, field
 import inspect
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -305,6 +306,8 @@ class Trainer:
         self._preload_current_order: Optional[np.ndarray] = None
         self._last_preload_order: Optional[np.ndarray] = None
         self._last_preload_case: Optional[Dict[str, np.ndarray]] = None
+        self._order_bank: List[np.ndarray] = []
+        self._order_bank_nb: int = 0
         self._train_vars: List[tf.Variable] = []
         self._total_ref: Optional[TotalEnergy] = None
         self._base_weights: Dict[str, float] = {}
@@ -1240,7 +1243,7 @@ class Trainer:
         base_order = None if self._last_preload_order is None else self._last_preload_order.copy()
         if base_order is None:
             if self.cfg.preload_randomize_order:
-                order = np.random.permutation(P.shape[0]).astype(np.int32)
+                order = self._next_order_from_bank(P.shape[0])
             else:
                 order = np.arange(P.shape[0], dtype=np.int32)
         else:
@@ -1249,6 +1252,32 @@ class Trainer:
         case["order"] = order
         case.update(self._build_stage_case(P, order))
         return case
+
+    def _next_order_from_bank(self, nb: int) -> np.ndarray:
+        nb = int(max(1, nb))
+        if nb <= 1:
+            return np.zeros((1,), dtype=np.int32)
+        if self._order_bank_nb != nb or not self._order_bank:
+            self._refill_order_bank(nb)
+        if not self._order_bank:
+            return np.random.permutation(nb).astype(np.int32)
+        return self._order_bank.pop().astype(np.int32)
+
+    def _refill_order_bank(self, nb: int) -> None:
+        nb = int(max(1, nb))
+        try:
+            perms = list(itertools.permutations(range(nb)))
+        except Exception:
+            perms = []
+        if not perms:
+            self._order_bank = []
+            self._order_bank_nb = nb
+            return
+        perm_idx = np.random.permutation(len(perms))
+        self._order_bank = [
+            np.asarray(perms[i], dtype=np.int32) for i in perm_idx.tolist()
+        ]
+        self._order_bank_nb = nb
 
     def _make_preload_params(self, case: Dict[str, np.ndarray]) -> Dict[str, Any]:
         params: Dict[str, Any] = {"P": tf.convert_to_tensor(case["P"], dtype=tf.float32)}
