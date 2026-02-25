@@ -129,10 +129,12 @@ class TrainerConfig:
     contact_mu_n_start: Optional[float] = None
     friction_k_t_start: Optional[float] = None
     friction_mu_t_start: Optional[float] = None
-    friction_smooth_schedule: bool = False     # True: 先平滑摩擦，后切换到严格 ALM
-    friction_smooth_fraction: float = 0.3      # 使用平滑摩擦的训练步数占比
-    friction_smooth_steps: Optional[int] = None  # 若给定则覆盖 fraction
-    friction_blend_steps: Optional[int] = None   # 平滑->严格 线性混合步数
+    friction_smooth_schedule: bool = False
+    friction_smooth_fraction: float = 0.3
+    friction_smooth_steps: Optional[int] = None
+    friction_off_fraction: float = 0.1
+    friction_off_steps: Optional[int] = None
+    friction_blend_steps: Optional[int] = None
 
     # 体积分点（弹性能量）RAR
     volume_rar_enabled: bool = True            # 是否启用体积分点基于应变能密度的 RAR
@@ -1962,65 +1964,100 @@ class Trainer:
             self.contact.friction.mu_t.assign(mu_t)
         except Exception:
             pass
+    def _resolve_friction_schedule_windows(self) -> Tuple[int, int, int]:
+        max_steps = max(1, int(getattr(self.cfg, "max_steps", 1)))
 
-    def _maybe_update_friction_smoothing(self, step: int):
-        """Switch friction energy from smooth to strict according to schedule."""
+        smooth_steps = getattr(self.cfg, "friction_smooth_steps", None)
+        if smooth_steps is None or int(smooth_steps) <= 0:
+            frac = float(np.clip(getattr(self.cfg, "friction_smooth_fraction", 0.0), 0.0, 1.0))
+            smooth_steps = int(frac * max_steps)
+        else:
+            smooth_steps = int(max(0, int(smooth_steps)))
 
-        if self.contact is None or not self.cfg.friction_smooth_schedule:
-            return
+        off_steps = getattr(self.cfg, "friction_off_steps", None)
+        if off_steps is None or int(off_steps) < 0:
+            off_frac = float(np.clip(getattr(self.cfg, "friction_off_fraction", 0.0), 0.0, 1.0))
+            off_steps = int(off_frac * max_steps)
+        else:
+            off_steps = int(max(0, int(off_steps)))
+        off_steps = min(off_steps, smooth_steps)
+
+        blend_steps = getattr(self.cfg, "friction_blend_steps", None)
+        if blend_steps is None or int(blend_steps) < 0:
+            blend_steps = 0
+        else:
+            blend_steps = int(blend_steps)
+
+        return off_steps, smooth_steps, blend_steps
+
+    def _resolve_friction_mode_for_step(self, step: int) -> str:
+        if not bool(getattr(self.cfg, "friction_smooth_schedule", False)):
+            return "strict"
+
         loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
         if loss_mode in {"residual", "residual_only", "res"}:
+            return "strict"
+
+        off_steps, smooth_steps, blend_steps = self._resolve_friction_schedule_windows()
+        if smooth_steps <= 0:
+            return "strict"
+
+        step_i = max(0, int(step))
+        if off_steps > 0 and step_i <= off_steps:
+            return "off"
+        if step_i <= smooth_steps:
+            return "smooth"
+        if blend_steps > 0 and step_i <= smooth_steps + blend_steps:
+            return "blend"
+        return "strict"
+
+    def _maybe_update_friction_smoothing(self, step: int):
+        """Switch friction mode according to off -> smooth/blend -> strict curriculum."""
+
+        if self.contact is None:
             return
 
-        smooth_steps = self.cfg.friction_smooth_steps
-        if smooth_steps is None or smooth_steps <= 0:
-            frac = float(np.clip(self.cfg.friction_smooth_fraction, 0.0, 1.0))
-            smooth_steps = int(max(0, frac * max(1, self.cfg.max_steps)))
+        mode = self._resolve_friction_mode_for_step(step)
+        off_steps, smooth_steps, blend_steps = self._resolve_friction_schedule_windows()
 
-        blend_steps = self.cfg.friction_blend_steps
-        if blend_steps is None or blend_steps < 0:
-            blend_steps = 0
-
-        if smooth_steps <= 0:
-            blend = 0.0
-        elif step <= smooth_steps:
+        if mode == "smooth":
             blend = 1.0
-        elif blend_steps > 0 and step <= smooth_steps + blend_steps:
-            t = float(step - smooth_steps) / float(blend_steps)
+        elif mode == "blend" and blend_steps > 0:
+            t = float(step - smooth_steps) / float(max(1, blend_steps))
             blend = max(0.0, min(1.0, 1.0 - t))
         else:
             blend = 0.0
 
-        if blend >= 0.999:
-            mode = "smooth"
-        elif blend <= 0.001:
-            mode = "strict"
-        else:
-            mode = "blend"
+        use_smooth = mode in {"smooth", "blend"}
+        friction_enabled = mode != "off"
 
-        if self._friction_smooth_state is not None and mode == self._friction_smooth_state:
-            # still update blend value even if mode unchanged
-            pass
-
+        prev_mode = self._friction_smooth_state
         self._friction_smooth_state = mode
         try:
-            use_smooth = blend > 0.0
+            if hasattr(self.contact, "cfg") and hasattr(self.contact.cfg, "friction"):
+                self.contact.cfg.friction.enabled = bool(friction_enabled)
+            if hasattr(self.contact.friction, "cfg"):
+                self.contact.friction.cfg.enabled = bool(friction_enabled)
+
             if hasattr(self.contact.friction, "set_smooth_friction"):
                 self.contact.friction.set_smooth_friction(use_smooth)
             else:
                 self.contact.friction.cfg.use_smooth_friction = use_smooth
+
             if hasattr(self.contact.friction, "set_smooth_blend"):
                 self.contact.friction.set_smooth_blend(blend)
             else:
                 self.contact.friction.cfg.smooth_blend = float(blend)
+
             self.contact.cfg.use_smooth_friction = use_smooth
         except Exception:
             pass
 
-        if mode == "blend":
-            print(f"[friction] 切换摩擦能量路径: blend ({blend:.2f}) (step {step})")
-        else:
-            print(f"[friction] 切换摩擦能量路径: {mode} (step {step})")
+        if prev_mode != mode:
+            if mode == "blend":
+                print(f"[friction] ??????: blend ({blend:.2f}) (step {step})")
+            else:
+                print(f"[friction] ??????: {mode} (step {step})")
 
     # ----------------- Contact-driven RAR -----------------
 
