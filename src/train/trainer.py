@@ -1,0 +1,4015 @@
+# -*- coding: utf-8 -*-
+"""
+trainer.py — 主训练循环（精简日志 + 分阶段进度提示）。
+
+该版本专注于保留关键构建/训练信息：
+  - 初始化时报告是否启用 GPU。
+  - 构建阶段仅输出必需的信息与接触汇总。
+  - 单步训练进度条会标注当前阶段，便于观察训练流程。
+"""
+from __future__ import annotations
+from train.attach_ties_bcs import attach_ties_and_bcs_from_inp
+
+import os
+import sys
+import time
+import copy
+import re
+import math
+import shutil
+from dataclasses import dataclass, field
+import inspect
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import tensorflow as tf
+from tqdm.auto import tqdm  # 仅用 tqdm.auto，适配 PyCharm/终端
+
+# ---------- TF 显存与分配器 ----------
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+
+try:
+    import colorama
+    colorama.just_fix_windows_console()
+    _ANSI_WHITE = colorama.Fore.WHITE
+    _ANSI_RESET = colorama.Style.RESET_ALL
+except Exception:
+    colorama = None
+    _ANSI_WHITE = ""
+    _ANSI_RESET = ""
+
+import builtins as _builtins
+
+
+def _wrap_white(text: str) -> str:
+    if not _ANSI_WHITE:
+        return text
+    return f"{_ANSI_WHITE}{text}{_ANSI_RESET}"
+
+
+def print(*values, sep: str = " ", end: str = "\n", file=None, flush: bool = False):
+    """Module-local print that forces white foreground text on stdout/stderr."""
+
+    target = sys.stdout if file is None else file
+    msg = sep.join(str(v) for v in values)
+    if target in (sys.stdout, sys.stderr):
+        msg = _wrap_white(msg)
+    try:
+        _builtins.print(msg, end=end, file=target, flush=flush)
+    except UnicodeEncodeError:
+        # Windows consoles may use legacy encodings (e.g. GBK) and crash on
+        # special Unicode symbols. Keep Chinese text if possible, escape only
+        # the unencodable characters.
+        enc = getattr(target, "encoding", None) or "utf-8"
+        safe = msg.encode(enc, errors="backslashreplace").decode(enc, errors="ignore")
+        _builtins.print(safe, end=end, file=target, flush=flush)
+
+# 让 src 根目录可导入
+_SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".", "."))
+if _SRC_ROOT not in sys.path:
+    sys.path.insert(0, _SRC_ROOT)
+
+# ---------- 项目模块 ----------
+from inp_io.inp_parser import load_inp, AssemblyModel
+from inp_io.cdb_parser import load_cdb
+from mesh.volume_quadrature import build_volume_points
+from mesh.contact_pairs import ContactPairSpec, build_contact_map, resample_contact_map
+from physics.material_lib import MaterialLibrary
+from model.pinn_model import create_displacement_model, ModelConfig, DisplacementModel
+from physics.elasticity_energy import ElasticityEnergy, ElasticityConfig
+from physics.contact.contact_operator import ContactOperator, ContactOperatorConfig
+from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig
+from physics.tie_constraints import TiePenalty, TieConfig
+from physics.tightening_model import NutTighteningPenalty, TighteningConfig, NutSpec
+from model.loss_energy import TotalEnergy, TotalConfig
+from train.loss_weights import LossWeightState, update_loss_weights, combine_loss
+from viz.mirror_viz import plot_mirror_deflection_by_name
+
+
+# ----------------- 配置 -----------------
+@dataclass
+class TrainerConfig:
+    inp_path: str = "data/shuangfan.inp"
+
+    # 镜面名称（裸名字），以及对应 ASM 键名（可空，自动猜）
+    mirror_surface_name: str = "MIRROR up"
+    mirror_surface_asm_key: Optional[str] = None   # e.g. 'ASM::"MIRROR up"'
+
+    # 材料库（名字 -> (E, nu)）
+    # - supports legacy tuple (E, nu) or dict {"E": ..., "nu": ...}
+    materials: Dict[str, Any] = field(default_factory=lambda: {
+        "mirror": (70000.0, 0.33),
+        "steel":  (210000.0, 0.30),
+    })
+    # 零件到材料名映射
+    part2mat: Dict[str, str] = field(default_factory=lambda: {
+        "MIRROR": "mirror",
+        "BOLT1": "steel",
+        "BOLT2": "steel",
+        "BOLT3": "steel",
+    })
+
+    # 接触
+    contact_pairs: List[Dict[str, str]] = field(default_factory=list)
+    n_contact_points_per_pair: int = 6000
+    contact_seed: int = 1234
+    contact_rar_enabled: bool = True           # 是否启用接触残差驱动的自适应重采样
+    contact_rar_fraction: float = 0.5          # 每次重采样中，多少比例来自残差加权抽样
+    contact_rar_temperature: float = 1.0       # >1 平滑、<1 更尖锐
+    contact_rar_floor: float = 1e-6            # 防止全零残差
+    contact_rar_uniform_ratio: float = 0.3     # 保留多少比例的全局均匀点，避免过拟合热点
+    contact_rar_fric_mix: float = 0.4          # 穿透 vs 摩擦残差的混合系数
+    contact_rar_balance_pairs: bool = True     # 是否保持各接触对的样本占比
+
+    # 接触参数“软→硬”调度（用于训练前期更稳、后期更严格）
+    contact_hardening_enabled: bool = True
+    contact_hardening_fraction: float = 0.4    # 在前多少比例 steps 内线性/平滑提升到目标值
+    contact_beta_start: Optional[float] = None
+    contact_mu_n_start: Optional[float] = None
+    friction_k_t_start: Optional[float] = None
+    friction_mu_t_start: Optional[float] = None
+    friction_smooth_schedule: bool = False     # True: 先平滑摩擦，后切换到严格 ALM
+    friction_smooth_fraction: float = 0.3      # 使用平滑摩擦的训练步数占比
+    friction_smooth_steps: Optional[int] = None  # 若给定则覆盖 fraction
+    friction_blend_steps: Optional[int] = None   # 平滑->严格 线性混合步数
+
+    # 体积分点（弹性能量）RAR
+    volume_rar_enabled: bool = True            # 是否启用体积分点基于应变能密度的 RAR
+    volume_rar_fraction: float = 0.5           # 每步 DFEM 子单元子采样中，多少比例来自 RAR
+    volume_rar_temperature: float = 1.0        # >1 平滑、<1 更尖锐
+    volume_rar_uniform_ratio: float = 0.2      # 保底均匀抽样比例
+    volume_rar_floor: float = 1e-8             # 基础重要性，避免全零
+    volume_rar_ema_decay: float = 0.9          # 重要性 EMA 平滑系数（0~1，越大越平滑）
+
+    # 拧紧（螺母旋转角）
+    preload_specs: List[Dict[str, str]] = field(default_factory=list)
+    preload_n_points_each: int = 800
+
+    # tie / 边界（如需）
+    ties: List[Dict[str, Any]] = field(default_factory=list)
+    bcs: List[Dict[str, Any]] = field(default_factory=list)
+    bc_mode: str = "alm"                    # penalty | hard | alm
+    bc_mu: float = 1.0e3                    # ALM 增广系数
+    bc_alpha: float = 1.0e4                 # 罚函数/ALM 基础刚度
+
+    # 预紧力范围（N）
+    preload_min: float = 0.0
+    preload_max: float = 2000.0
+    preload_sequence: List[Any] = field(default_factory=list)
+    preload_sequence_repeat: int = 1
+    preload_sequence_shuffle: bool = False
+    preload_sequence_jitter: float = 0.0
+
+    # 预紧采样方式
+    preload_sampling: str = "lhs"            # "lhs" | "uniform"
+    preload_lhs_size: int = 64               # 每批次的拉丁超立方样本数量
+
+    # 预紧顺序（分步加载）
+    preload_use_stages: bool = False
+    preload_randomize_order: bool = True
+
+    # incremental staged training (Mode A)
+    incremental_mode: bool = False
+    stage_inner_steps: int = 1            # backprop steps per stage
+    stage_alm_every: int = 1              # update ALM every N stages
+    stage_resample_contact: bool = False  # resample contact at each stage switch
+    reset_contact_state_per_case: bool = True
+    stage_schedule_steps: List[int] = field(default_factory=list)
+
+    # Contact-gated architecture context (from CDB/contact map)
+    contact_context_enabled: bool = True
+    contact_context_max_centroids: int = 16
+
+    # Loss innovation: region curriculum switch (handled in TotalEnergy)
+    region_curriculum_enabled: bool = True
+
+    # Training-speed innovation: multi-fidelity curriculum
+    speed_multifidelity_enabled: bool = True
+    speed_coarse_fraction: float = 0.35
+    speed_coarse_volume_ratio: float = 0.35
+    speed_coarse_contact_ratio: float = 0.5
+    speed_coarse_preload_ratio: float = 0.5
+    speed_target_pen_ratio: float = 0.20
+
+    # 物理项/模型配置
+    model_cfg: ModelConfig = field(default_factory=ModelConfig)
+    elas_cfg: ElasticityConfig = field(
+        default_factory=lambda: ElasticityConfig(coord_scale=1.0, chunk_size=0, use_pfor=False)
+    )
+    contact_cfg: ContactOperatorConfig = field(default_factory=ContactOperatorConfig)
+    tightening_cfg: TighteningConfig = field(default_factory=TighteningConfig)
+    total_cfg: TotalConfig = field(default_factory=lambda: TotalConfig(
+        w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_pre=1.0, w_sigma=1.0, w_eq=0.0
+    ))
+
+    # 损失加权（自适应）
+    loss_adaptive_enabled: bool = True
+    loss_update_every: int = 1
+    loss_ema_decay: float = 0.95
+    loss_min_factor: float = 0.25
+    loss_max_factor: float = 4.0
+    loss_min_weight: Optional[float] = None
+    loss_max_weight: Optional[float] = None
+    loss_gamma: float = 2.0
+    loss_focus_terms: Tuple[str, ...] = field(default_factory=tuple)
+
+    # 训练超参
+    max_steps: int = 1000
+    adam_steps: Optional[int] = None
+    lr: float = 1e-3
+    grad_clip_norm: Optional[float] = 1.0
+    log_every: int = 1
+    alm_update_every: int = 10
+    resample_contact_every: int = 10
+    lbfgs_enabled: bool = False
+    lbfgs_max_iter: int = 200
+    lbfgs_tolerance: float = 1e-6
+    lbfgs_history_size: int = 50
+    lbfgs_line_search: int = 50
+    lbfgs_reuse_last_batch: bool = True
+
+    # 进度条颜色（None 则禁用彩色，使用终端默认色）
+    build_bar_color: Optional[str] = "cyan"
+    train_bar_color: Optional[str] = "cyan"
+    step_bar_color: Optional[str] = "green"
+
+    # 精度/随机种子
+    mixed_precision: Optional[str] = "mixed_float16"
+    seed: int = 42
+
+    # 输出
+    out_dir: str = "outputs"
+    ckpt_dir: str = "checkpoints"
+    ckpt_max_to_keep: int = 3
+    ckpt_save_retries: int = 3
+    ckpt_save_retry_delay_s: float = 1.0
+    ckpt_save_retry_backoff: float = 2.0
+    viz_samples_after_train: int = 6
+    viz_title_prefix: str = "Total Deformation (trained PINN)"
+    viz_style: str = "smooth"              # 默认使用 Gouraud 平滑着色
+    viz_colormap: str = "turbo"
+    viz_diagnose_blanks: bool = False      # 是否诊断可视化中的空白区域
+    viz_auto_fill_blanks: bool = False     # 是否尝试自动填充空白区域             # Abaqus-like rainbow palette
+    viz_levels: int = 64                    # 等值线数量，提升平滑度（仅 contour 模式）
+    viz_symmetric: bool = False             # displacement magnitude is nonnegative
+    viz_units: str = "mm"
+    viz_draw_wireframe: bool = False        # 关闭三角网格叠加，避免出现“双层网格”感
+    viz_surface_enabled: bool = True        # 是否渲染单一镜面云图
+    viz_surface_source: str = "part_top"    # "surface" 使用 INP 表面；"part_top" 优先用零件外表面上表面
+    viz_write_data: bool = True             # export displacement samples next to figure
+    viz_write_surface_mesh: bool = False    # export reconstructed FE surface mesh next to figure
+    viz_plot_full_structure: bool = False   # 导出全装配（或指定零件）的位移云图
+    viz_full_structure_part: Optional[str] = "mirror1"  # None -> 全装配
+    viz_write_full_structure_data: bool = False  # 记录全装配位移数据
+    viz_retriangulate_2d: bool = False      # 兼容旧配置的占位符，不再使用
+    viz_refine_subdivisions: int = 3        # 更细的细分以获得更平滑的云图
+    viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
+    viz_use_shape_function_interp: bool = False  # 细分可选采用线性形函数插值，避免重新跑网络
+    viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
+    viz_eval_scope: str = "assembly"        # "surface" or "assembly"/"all"
+    viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
+    viz_auto_fill_blanks: bool = False      # 覆盖率低时自动用 2D 重新三角化填补留白（默认关闭以保留真实孔洞）
+    viz_remove_rigid: bool = True           # 可视化时默认去除刚体平移/转动分量
+    viz_plot_stages: bool = False           # preload_use_stages 时额外输出每个加载阶段的云图
+    viz_compare_cases: bool = True          # 固定6组云图后追加“差值云图/对比报告”
+    viz_compare_cmap: str = "coolwarm"      # 差值云图配色（建议发散色图）
+    viz_compare_common_scale: bool = True   # 追加同一色标(0~max)的可比云图
+    save_best_on: str = "Pi"   # or "E_int"
+
+    # 材料屈服强度（可选，用于日志中输出 σ_vm/σ_y 比值）；单位需与应力一致
+    yield_strength: Optional[float] = None
+
+
+class Trainer:
+    def __init__(self, cfg: TrainerConfig):
+        self.cfg = cfg
+        np.random.seed(cfg.seed)
+        tf.random.set_seed(cfg.seed)
+
+        self._preload_dim: int = 3
+        self._preload_lhs_rng = np.random.default_rng(cfg.seed + 11)
+        self._preload_lhs_points: np.ndarray = np.zeros((0, self._preload_dim), dtype=np.float32)
+        self._preload_lhs_index: int = 0
+
+        # 默认设备描述，避免后续日志访问属性时出错
+        self.device_summary = "Unknown"
+        self._step_stage_times: List[Tuple[str, float]] = []
+        self._pi_baseline: Optional[float] = None
+        self._pi_ema: Optional[float] = None
+        self._prev_pi: Optional[float] = None
+        self._preload_sequence: List[np.ndarray] = []
+        self._preload_sequence_orders: List[Optional[np.ndarray]] = []
+        self._preload_sequence_index: int = 0
+        self._preload_sequence_hold: int = 0
+        self._preload_current_target: Optional[np.ndarray] = None
+        self._preload_current_order: Optional[np.ndarray] = None
+        self._last_preload_order: Optional[np.ndarray] = None
+        self._last_preload_case: Optional[Dict[str, np.ndarray]] = None
+        self._train_vars: List[tf.Variable] = []
+        self._total_ref: Optional[TotalEnergy] = None
+        self._base_weights: Dict[str, float] = {}
+        self._loss_keys: List[str] = []
+        self._contact_rar_cache: Optional[Dict[str, Any]] = None
+        self._volume_rar_cache: Optional[Dict[str, Any]] = None
+        self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
+        self._contact_hardening_targets: Optional[Dict[str, float]] = None
+        self._friction_smooth_state: Optional[str] = None
+        self._base_n_contact_points_per_pair: int = int(cfg.n_contact_points_per_pair)
+        self._base_preload_n_points_each: int = int(cfg.preload_n_points_each)
+        self._base_n_points_per_step: Optional[int] = (
+            None if cfg.elas_cfg.n_points_per_step is None else int(cfg.elas_cfg.n_points_per_step)
+        )
+        self._multifidelity_state: str = ""
+        self._run_start_time: Optional[float] = None
+        self._time_to_target_step: Optional[int] = None
+        self._time_to_target_seconds: Optional[float] = None
+
+        if cfg.preload_specs:
+            self._set_preload_dim(len(cfg.preload_specs))
+
+        if cfg.preload_sequence:
+            sanitized: List[np.ndarray] = []
+            sanitized_orders: List[Optional[np.ndarray]] = []
+            for idx, entry in enumerate(cfg.preload_sequence):
+                order_entry = None
+                values_entry: Any = entry
+                if isinstance(entry, dict):
+                    order_entry = entry.get("order")
+                    for key in ("values", "loads", "P", "p", "preload", "forces"):
+                        if key in entry:
+                            values_entry = entry[key]
+                            break
+                try:
+                    arr = np.array(values_entry, dtype=np.float32).reshape(-1)
+                except Exception:
+                    print(
+                        f"[tightening] 忽略 preload_sequence[{idx}]，无法解析为浮点数组：{entry}"
+                    )
+                    sanitized_orders.append(None)
+                    continue
+                if arr.size == 0:
+                    print(f"[tightening] 忽略 preload_sequence[{idx}]，未提供数值。")
+                    sanitized_orders.append(None)
+                    continue
+                nb = int(getattr(self, "_preload_dim", 0) or len(cfg.preload_specs) or 1)
+                if arr.size == 1:
+                    arr = np.repeat(arr, nb)
+                if arr.size != nb:
+                    print(
+                        f"[tightening] ?? preload_sequence[{idx}]??? {nb} ?????? {arr.size} ??"
+                    )
+                    sanitized_orders.append(None)
+                    continue
+
+                order_arr: Optional[np.ndarray] = None
+                if order_entry is not None:
+                    try:
+                        order_raw = np.array(order_entry, dtype=np.int32).reshape(-1)
+                    except Exception:
+                        print(
+                            f"[tightening] 忽略 preload_sequence[{idx}] 的顺序字段，无法解析：{order_entry}"
+                        )
+                        order_raw = None
+                    if order_raw is not None:
+                        nb = arr.size
+                        if order_raw.size != nb:
+                            print(
+                                f"[tightening] 忽略 preload_sequence[{idx}] 的顺序字段，长度需为 {nb}。"
+                            )
+                        else:
+                            if np.all(order_raw >= 1) and np.max(order_raw) <= nb and np.min(order_raw) >= 1:
+                                order_raw = order_raw - 1
+                            unique = sorted(set(order_raw.tolist()))
+                            if unique != list(range(nb)):
+                                print(
+                                    f"[tightening] 忽略 preload_sequence[{idx}] 的顺序字段，必须是 0~{nb-1} 的排列（或 1~{nb}）。"
+                                )
+                            else:
+                                order_arr = order_raw.astype(np.int32)
+
+                sanitized.append(arr.astype(np.float32))
+                sanitized_orders.append(order_arr.copy() if order_arr is not None else None)
+
+            if sanitized:
+                if cfg.preload_sequence_shuffle:
+                    perm = np.random.permutation(len(sanitized))
+                    sanitized = [sanitized[i] for i in perm]
+                    sanitized_orders = [sanitized_orders[i] for i in perm]
+                self._preload_sequence = sanitized
+                self._preload_sequence_orders = sanitized_orders
+                self._preload_current_target = self._preload_sequence[0].copy()
+                if self._preload_sequence_orders:
+                    self._preload_current_order = (
+                        None
+                        if self._preload_sequence_orders[0] is None
+                        else self._preload_sequence_orders[0].copy()
+                    )
+                hold = max(1, cfg.preload_sequence_repeat)
+                print(
+                    f"[tightening] 已启用顺序载荷：{len(self._preload_sequence)} 组，",
+                    f"每组持续 {hold} 步。"
+                )
+                if cfg.preload_sequence_jitter > 0:
+                    print(
+                        f"[tightening] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
+                    )
+                self._set_preload_dim(self._preload_sequence[0].size)
+            else:
+                print("[tightening] preload_sequence 中有效条目为空，改为随机采样。")
+        if cfg.model_cfg.preload_scale:
+            print(
+                f"[tightening] 归一化: shift={cfg.model_cfg.preload_shift:.2f}, "
+                f"scale={cfg.model_cfg.preload_scale:.2f}"
+            )
+
+        # 显存增长
+        gpus = tf.config.list_physical_devices('GPU')
+        gpu_labels = []
+        for idx, g in enumerate(gpus):
+            try:
+                tf.config.experimental.set_memory_growth(g, True)
+            except Exception:
+                pass
+            label = getattr(g, "name", None)
+            if label:
+                label = label.split("/")[-1]
+                parts = label.split(":")
+                if len(parts) >= 2:
+                    label = ":".join(parts[-2:])
+            else:
+                label = f"GPU:{idx}"
+            gpu_labels.append(label)
+
+        if gpu_labels:
+            self.device_summary = f"GPU ({', '.join(gpu_labels)})"
+            print(f"[trainer] 使用 GPU 进行训练: {', '.join(gpu_labels)}")
+        else:
+            self.device_summary = "CPU"
+            print("[trainer] 未检测到 GPU，将在 CPU 上训练。")
+
+        # 混合精度
+        if cfg.mixed_precision:
+            try:
+                tf.keras.mixed_precision.set_global_policy(cfg.mixed_precision)
+                print(f"[pinn_model] Mixed precision policy set to: {cfg.mixed_precision}")
+            except Exception as e:
+                print("[pinn_model] Failed to set mixed precision:", e)
+
+        os.makedirs(cfg.out_dir, exist_ok=True)
+        os.makedirs(cfg.ckpt_dir, exist_ok=True)
+
+        # 组件
+        self.asm: Optional[AssemblyModel] = None
+        self.matlib: Optional[MaterialLibrary] = None
+        self.model = None
+        self.optimizer = None
+
+        self.elasticity: Optional[ElasticityEnergy] = None
+        self.contact: Optional[ContactOperator] = None
+        self.tightening: Optional[NutTighteningPenalty] = None
+        self.ties_ops: List[TiePenalty] = []
+        self.bcs_ops: List[BoundaryPenalty] = []
+        self._cp_specs: List[ContactPairSpec] = []
+
+        self.ckpt = None
+        self.ckpt_manager = None
+        self.best_metric = float("inf")
+
+        # —— 体检/调试可读
+        self.X_vol = None
+        self.w_vol = None
+        self.mat_id = None
+        self.enum_names: List[str] = []
+        self.id2props_map: Dict[int, Tuple[float, float]] = {}
+        # 自适应损失权重的状态（在 run() 里初始化）
+        self.loss_state: Optional[LossWeightState] = None
+
+
+    # ----------------- 辅助工具 -----------------
+    def _cleanup_stale_ckpt_temp_dirs(self):
+        ckpt_dir = getattr(self.cfg, "ckpt_dir", None)
+        if not ckpt_dir:
+            return
+        try:
+            entries = os.listdir(ckpt_dir)
+        except Exception:
+            return
+        for name in entries:
+            if not (name.startswith("ckpt-") and name.endswith("_temp")):
+                continue
+            path = os.path.join(ckpt_dir, name)
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _save_checkpoint_best_effort(self, checkpoint_number: Optional[int]) -> Optional[str]:
+        if self.ckpt_manager is None:
+            return None
+
+        retries = max(0, int(getattr(self.cfg, "ckpt_save_retries", 0)))
+        delay_s = float(getattr(self.cfg, "ckpt_save_retry_delay_s", 0.0))
+        backoff = float(getattr(self.cfg, "ckpt_save_retry_backoff", 1.0))
+        delay_s = max(0.0, delay_s)
+        backoff = max(1.0, backoff)
+
+        for attempt in range(retries + 1):
+            try:
+                # 若对齐 step 保存失败，可让 manager 使用内部自增编号继续尝试，
+                # 这样能避开同名 *_temp 残留导致的二次失败。
+                if attempt == 0:
+                    return self.ckpt_manager.save(checkpoint_number=checkpoint_number)
+                return self.ckpt_manager.save(checkpoint_number=None)
+            except UnicodeDecodeError as exc:
+                msg = repr(exc)
+                print(
+                    f"[trainer] WARNING: checkpoint 保存失败 (UnicodeDecodeError) "
+                    f"attempt={attempt + 1}/{retries + 1} ({msg})"
+                )
+            except Exception as exc:
+                print(
+                    f"[trainer] WARNING: checkpoint 保存失败 "
+                    f"attempt={attempt + 1}/{retries + 1}: {exc}"
+                )
+
+            # 清理残留 *_temp 目录，避免下一次保存被同名目录影响
+            self._cleanup_stale_ckpt_temp_dirs()
+            if attempt < retries and delay_s > 0:
+                time.sleep(delay_s)
+                delay_s *= backoff
+        return None
+
+    def _set_preload_dim(self, nb: int):
+        nb_int = int(nb)
+        if nb_int <= 0:
+            nb_int = 3
+        if nb_int != getattr(self, "_preload_dim", None):
+            self._preload_dim = nb_int
+            self._preload_lhs_points = np.zeros((0, nb_int), dtype=np.float32)
+            self._preload_lhs_index = 0
+
+    def _generate_lhs_points(self, n_samples: int, n_dim: int, lo: float, hi: float) -> np.ndarray:
+        """简单的拉丁超立方采样生成器，返回 (n_samples, n_dim)."""
+
+        if n_samples <= 0:
+            return np.zeros((0, n_dim), dtype=np.float32)
+        unit = np.zeros((n_samples, n_dim), dtype=np.float32)
+        for j in range(n_dim):
+            seg = (np.arange(n_samples, dtype=np.float32) + self._preload_lhs_rng.random(n_samples)) / float(n_samples)
+            self._preload_lhs_rng.shuffle(seg)
+            unit[:, j] = seg
+        scale = hi - lo
+        return (lo + unit * scale).astype(np.float32)
+
+    def _next_lhs_preload(self, n_dim: int, lo: float, hi: float) -> np.ndarray:
+        batch = max(1, int(self.cfg.preload_lhs_size))
+        if self._preload_lhs_points.shape[1] != n_dim or len(self._preload_lhs_points) == 0:
+            self._preload_lhs_points = self._generate_lhs_points(batch, n_dim, lo, hi)
+            self._preload_lhs_index = 0
+        if self._preload_lhs_index >= len(self._preload_lhs_points):
+            self._preload_lhs_points = self._generate_lhs_points(batch, n_dim, lo, hi)
+            self._preload_lhs_index = 0
+        out = self._preload_lhs_points[self._preload_lhs_index].copy()
+        self._preload_lhs_index += 1
+        return out
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        if seconds < 1e-3:
+            return f"{seconds * 1e6:.0f}µs"
+        if seconds < 1:
+            return f"{seconds * 1e3:.1f}ms"
+        return f"{seconds:.2f}s"
+
+    @staticmethod
+    def _short_device_name(device: Optional[str]) -> str:
+        if not device:
+            return "?"
+        if "/device:" in device:
+            return device.split("/device:")[-1]
+        if device.startswith("/"):
+            return device.split(":")[-1]
+        return device
+
+    @staticmethod
+    def _wrap_bar_text(text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+        return _wrap_white(str(text))
+
+    def _set_pbar_desc(self, pbar, text: str) -> None:
+        pbar.set_description_str(self._wrap_bar_text(text))
+
+    def _set_pbar_postfix(self, pbar, text: str) -> None:
+        if text is None:
+            pbar.set_postfix_str(text)
+            return
+        pbar.set_postfix_str(self._wrap_bar_text(text))
+
+    @staticmethod
+    def _stat_float(stats: Optional[Mapping[str, Any]], *keys: str) -> Optional[float]:
+        """Extract scalar stats (supports staged keys like s3_cn_pen_ratio)."""
+
+        if not isinstance(stats, Mapping):
+            return None
+
+        for key in keys:
+            val = stats.get(key)
+            if val is None:
+                continue
+            try:
+                if hasattr(val, "numpy"):
+                    return float(val.numpy())
+                return float(val)
+            except Exception:
+                continue
+
+        best_stage = -1
+        best_val: Optional[float] = None
+        stage_re = re.compile(r"s(\d+)_")
+        for name, val in stats.items():
+            for key in keys:
+                if not str(name).endswith(key):
+                    continue
+                m = stage_re.match(str(name))
+                stage_idx = int(m.group(1)) if m else 0
+                if stage_idx < best_stage:
+                    continue
+                try:
+                    if hasattr(val, "numpy"):
+                        v = float(val.numpy())
+                    else:
+                        v = float(val)
+                except Exception:
+                    continue
+                best_stage = stage_idx
+                best_val = v
+        return best_val
+
+    def _extract_contact_context_from_cat(
+        self, cat: Optional[Dict[str, np.ndarray]]
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Build coarse contact centroids/normals from sampled contact pairs.
+        Returns (centroids, normals), each shaped (K,3).
+        """
+        if not cat:
+            return None
+        xs = np.asarray(cat.get("xs", np.zeros((0, 3))), dtype=np.float32).reshape(-1, 3)
+        xm = np.asarray(cat.get("xm", np.zeros((0, 3))), dtype=np.float32).reshape(-1, 3)
+        nn = np.asarray(cat.get("n", np.zeros((0, 3))), dtype=np.float32).reshape(-1, 3)
+        if xs.shape[0] == 0 or xm.shape[0] == 0:
+            return None
+        pair_ids = cat.get("pair_id", None)
+        points = 0.5 * (xs + xm)
+
+        max_k = max(1, int(getattr(self.cfg, "contact_context_max_centroids", 16)))
+        centroids: List[np.ndarray] = []
+        normals: List[np.ndarray] = []
+
+        if pair_ids is not None:
+            pid = np.asarray(pair_ids).reshape(-1)
+            for p in np.unique(pid):
+                mask = pid == p
+                if not np.any(mask):
+                    continue
+                c = points[mask].mean(axis=0)
+                n = nn[mask].mean(axis=0)
+                n_norm = np.linalg.norm(n)
+                if n_norm > 1e-8:
+                    n = n / n_norm
+                centroids.append(c.astype(np.float32))
+                normals.append(n.astype(np.float32))
+                if len(centroids) >= max_k:
+                    break
+
+        if not centroids:
+            c = points.mean(axis=0)
+            n = nn.mean(axis=0)
+            n_norm = np.linalg.norm(n)
+            if n_norm > 1e-8:
+                n = n / n_norm
+            centroids = [c.astype(np.float32)]
+            normals = [n.astype(np.float32)]
+
+        return np.stack(centroids, axis=0), np.stack(normals, axis=0)
+
+    def _apply_model_contact_context(
+        self, cat: Optional[Dict[str, np.ndarray]], reason: str = ""
+    ) -> None:
+        """Push CDB/contact-derived geometry context to the displacement model."""
+
+        if not bool(getattr(self.cfg, "contact_context_enabled", True)):
+            return
+        if self.model is None or not hasattr(self.model, "field"):
+            return
+        field = self.model.field
+        if not hasattr(field, "set_contact_context"):
+            return
+
+        context = self._extract_contact_context_from_cat(cat)
+        bbox_min = None
+        bbox_max = None
+        if getattr(self, "asm", None) is not None and getattr(self.asm, "nodes", None):
+            try:
+                xyz = np.asarray(list(self.asm.nodes.values()), dtype=np.float32).reshape(-1, 3)
+                if xyz.shape[0] > 0:
+                    bbox_min = xyz.min(axis=0)
+                    bbox_max = xyz.max(axis=0)
+            except Exception:
+                bbox_min = None
+                bbox_max = None
+
+        try:
+            if context is None:
+                field.set_contact_context(None, None, bbox_min=bbox_min, bbox_max=bbox_max)
+                return
+            centroids, normals = context
+            field.set_contact_context(centroids, normals, bbox_min=bbox_min, bbox_max=bbox_max)
+            tag = f" ({reason})" if reason else ""
+            print(
+                f"[model] 已更新接触上下文{tag}: centroids={int(centroids.shape[0])}"
+            )
+        except Exception as exc:
+            print(f"[model] WARNING: 更新接触上下文失败: {exc}")
+
+    def _maybe_update_multifidelity_schedule(self, step: int) -> str:
+        """Coarse-to-fine schedule for faster convergence under fixed wall-clock budget."""
+
+        if not bool(getattr(self.cfg, "speed_multifidelity_enabled", True)):
+            return ""
+        max_steps = max(1, int(getattr(self.cfg, "max_steps", 1)))
+        coarse_steps = max(
+            1, int(round(float(getattr(self.cfg, "speed_coarse_fraction", 0.35)) * max_steps))
+        )
+        in_coarse = step <= coarse_steps
+        state = "coarse" if in_coarse else "fine"
+
+        ratio_contact = (
+            float(getattr(self.cfg, "speed_coarse_contact_ratio", 0.5))
+            if in_coarse
+            else 1.0
+        )
+        ratio_preload = (
+            float(getattr(self.cfg, "speed_coarse_preload_ratio", 0.5))
+            if in_coarse
+            else 1.0
+        )
+        ratio_volume = (
+            float(getattr(self.cfg, "speed_coarse_volume_ratio", 0.35))
+            if in_coarse
+            else 1.0
+        )
+        ratio_contact = float(np.clip(ratio_contact, 0.05, 1.0))
+        ratio_preload = float(np.clip(ratio_preload, 0.05, 1.0))
+        ratio_volume = float(np.clip(ratio_volume, 0.05, 1.0))
+
+        note_parts: List[str] = []
+
+        target_contact = max(
+            64, int(round(float(self._base_n_contact_points_per_pair) * ratio_contact))
+        )
+        if self.cfg.n_contact_points_per_pair != target_contact:
+            self.cfg.n_contact_points_per_pair = target_contact
+            note_parts.append(f"contact={target_contact}")
+
+        target_preload = max(
+            64, int(round(float(self._base_preload_n_points_each) * ratio_preload))
+        )
+        if self.cfg.preload_n_points_each != target_preload:
+            self.cfg.preload_n_points_each = target_preload
+            note_parts.append(f"preload={target_preload}")
+
+        if self.elasticity is not None and self._base_n_points_per_step is not None:
+            target_vol = max(256, int(round(float(self._base_n_points_per_step) * ratio_volume)))
+            if getattr(self.elasticity.cfg, "n_points_per_step", None) != target_vol:
+                self.elasticity.cfg.n_points_per_step = target_vol
+                note_parts.append(f"vol={target_vol}")
+
+        if state != self._multifidelity_state:
+            self._multifidelity_state = state
+            note_parts.insert(0, f"stage={state}")
+
+        if note_parts:
+            msg = "[speed] multi-fidelity: " + ", ".join(note_parts)
+            print(msg)
+            return "mf:" + state
+        return ""
+
+    def _loss_weight_lookup(self) -> Dict[str, float]:
+        """Assemble the latest per-term loss weights for logging."""
+
+        weights = {
+            "E_int": getattr(self.cfg.total_cfg, "w_int", 1.0),
+            "E_cn": getattr(self.cfg.total_cfg, "w_cn", 1.0),
+            "E_ct": getattr(self.cfg.total_cfg, "w_ct", 1.0),
+            "E_fb": getattr(self.cfg.total_cfg, "w_fb", 0.0),
+            "E_region": getattr(self.cfg.total_cfg, "w_region", 0.0),
+            "E_tie": getattr(self.cfg.total_cfg, "w_tie", 1.0),
+            "E_bc": getattr(self.cfg.total_cfg, "w_bc", 1.0),
+            "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
+            "E_sigma": getattr(self.cfg.total_cfg, "w_sigma", 1.0),
+            "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
+        }
+        if self.loss_state is not None:
+            for key, value in self.loss_state.current.items():
+                try:
+                    weights[key] = float(value)
+                except Exception:
+                    weights[key] = value
+        return weights
+
+    @staticmethod
+    def _extract_part_scalar(parts: Mapping[str, tf.Tensor], *keys: str) -> Optional[float]:
+        for key in keys:
+            if key not in parts:
+                continue
+            value = parts[key]
+            try:
+                if isinstance(value, tf.Tensor):
+                    return float(value.numpy())
+                if isinstance(value, np.ndarray):
+                    return float(value)
+                return float(value)
+            except Exception:
+                continue
+        return None
+
+    def _format_energy_summary(self, parts: Mapping[str, tf.Tensor]) -> str:
+        display = [
+            ("E_int", "Eint"),
+            ("E_cn", "Ecn"),
+            ("E_ct", "Ect"),
+            ("E_fb", "Efb"),
+            ("E_region", "Ereg"),
+            ("E_tie", "Etie"),
+            ("E_bc", "Ebc"),
+            ("W_pre", "Wpre"),
+            ("E_tight", "Etight"),
+            ("E_sigma", "Esig"),
+            ("E_eq", "Eeq"),
+        ]
+        aliases = {
+            "E_cn": ("E_cn", "E_n"),
+            "E_ct": ("E_ct", "E_t"),
+        }
+        weights = self._loss_weight_lookup()
+        entries: List[str] = []
+        for key, label in display:
+            weight = weights.get(key, 0.0)
+            # Skip if weight is effectively zero
+            if abs(weight) < 1e-15:
+                continue
+            val = self._extract_part_scalar(parts, *aliases.get(key, (key,)))
+            if val is None:
+                continue
+            entries.append(f"{label}={val:.3e}(w={weight:.3g})")
+        return " ".join(entries)
+
+    def _format_train_log_postfix(
+        self,
+        P_np: np.ndarray,
+        Pi: tf.Tensor,
+        parts: Mapping[str, tf.Tensor],
+        stats: Optional[Mapping[str, Any]],
+        grad_val: float,
+        rel_pi: float,
+        rel_delta: Optional[float],
+        order: Optional[np.ndarray] = None,
+    ) -> Tuple[Optional[str], str]:
+        """Compose the detailed training log postfix for the outer progress bar.
+
+        Returns a tuple of ``(postfix, note)`` where ``postfix`` is the formatted
+        text (or ``None`` when formatting fails) and ``note`` summarises whether
+        logging succeeded.
+        """
+
+        try:
+            angles = [float(x) for x in P_np.tolist()]
+            pin = float(Pi.numpy())
+            energy_disp = self._format_energy_summary(parts)
+
+            tight_txt = ""
+            if isinstance(stats, Mapping):
+                tstats = stats.get("tightening")
+                if isinstance(tstats, Mapping):
+                    rms = tstats.get("rms")
+                    if hasattr(rms, "numpy"):
+                        rms = rms.numpy()
+                    try:
+                        vals = [float(x) for x in list(rms)[:3]]
+                        if vals:
+                            tight_txt = " rms=[" + ",".join(f"{v:.2e}" for v in vals) + "]"
+                    except Exception:
+                        pass
+
+            pen_ratio = None
+            stick_ratio = None
+            slip_ratio = None
+            mean_gap = None
+
+            def _get_stat_float(*keys: str) -> Optional[float]:
+                """
+                Extract a scalar from stats. Supports staged keys like 's3_cn_mean_gap'
+                by taking the highest stage index found.
+                """
+                if not isinstance(stats, Mapping):
+                    return None
+
+                # 1) direct lookup
+                for key in keys:
+                    val = stats.get(key)
+                    if val is None:
+                        continue
+                    try:
+                        if hasattr(val, "numpy"):
+                            return float(val.numpy())
+                        return float(val)
+                    except Exception:
+                        continue
+
+                # 2) staged lookup: pick latest stage sN_key
+                best_val = None
+                best_stage = -1
+                stage_re = re.compile(r"s(\\d+)_")
+                for name, val in stats.items():
+                    for key in keys:
+                        if not name.endswith(key):
+                            continue
+                        m = stage_re.match(name)
+                        stage_idx = int(m.group(1)) if m else 0
+                        if stage_idx < best_stage:
+                            continue
+                        try:
+                            if hasattr(val, "numpy"):
+                                v = float(val.numpy())
+                            else:
+                                v = float(val)
+                            best_stage = stage_idx
+                            best_val = v
+                        except Exception:
+                            continue
+                return best_val
+
+            pen_ratio = _get_stat_float("n_pen_ratio", "cn_pen_ratio", "pen_ratio")
+            stick_ratio = _get_stat_float("t_stick_ratio", "stick_ratio")
+            slip_ratio = _get_stat_float("t_slip_ratio", "slip_ratio")
+            min_gap = _get_stat_float("n_min_gap", "cn_min_gap", "min_gap")
+            mean_gap = _get_stat_float("n_mean_gap", "cn_mean_gap", "mean_gap")
+
+            grad_disp = f"grad={grad_val:.2e}"
+            rel_pct = rel_pi * 100.0 if rel_pi is not None else None
+            rel_disp = (
+                f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
+            )
+            delta_disp = (
+                f"ΔΠ={rel_delta * 100:+.1f}%" if rel_delta is not None else "ΔΠ=--"
+            )
+            pen_disp = (
+                f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
+            )
+            stick_disp = (
+                f"stick={stick_ratio * 100:.1f}%" if stick_ratio is not None else "stick=--"
+            )
+            slip_disp = (
+                f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
+            )
+            gap_p01 = None
+            if self.contact is not None:
+                try:
+                    metrics = self.contact.last_sample_metrics()
+                    gap_arr = metrics.get("gap") if isinstance(metrics, dict) else None
+                    if gap_arr is not None:
+                        g = np.asarray(gap_arr, dtype=np.float64).reshape(-1)
+                        g = g[np.isfinite(g)]
+                        if g.size > 0:
+                            gap_p01 = float(np.quantile(g, 0.01))
+                except Exception:
+                    pass
+
+            gap_terms: List[str] = []
+            if min_gap is not None:
+                gap_terms.append(f"gmin={min_gap:.2e}")
+            if gap_p01 is not None:
+                gap_terms.append(f"g01={gap_p01:.2e}")
+            if mean_gap is not None:
+                gap_terms.append(f"gmean={mean_gap:.2e}")
+            gap_disp = " ".join(gap_terms) if gap_terms else "gmean=--"
+
+            # Von Mises 应力及屈服比（若提供 yield_strength）
+            vm_phys_max = _get_stat_float("stress_vm_phys_max")
+            vm_pred_max = _get_stat_float("stress_vm_pred_max")
+            vm_ref = vm_phys_max if vm_phys_max is not None else vm_pred_max
+            if vm_phys_max is not None and vm_pred_max is not None:
+                vm_disp = f"σvm={vm_phys_max:.2e}(pred={vm_pred_max:.2e})"
+            elif vm_phys_max is not None:
+                vm_disp = f"σvm={vm_phys_max:.2e}"
+            elif vm_pred_max is not None:
+                vm_disp = f"σvm_pred={vm_pred_max:.2e}"
+            else:
+                vm_disp = ""
+            vm_ratio_disp = ""
+            if vm_ref is not None and getattr(self.cfg, "yield_strength", None):
+                y = float(self.cfg.yield_strength)
+                if y > 0:
+                    vm_ratio_disp = f"σvm/σy={vm_ref / y:.2f}"
+
+            order_txt = ""
+            if order is not None:
+                try:
+                    order_list = [int(x) for x in list(order)]
+                    human_order = "-".join(str(idx + 1) for idx in order_list)
+                    ordered_values: Optional[List[int]] = None
+                    if P_np is not None and len(order_list) == len(P_np):
+                        ordered_values = []
+                        for idx in order_list:
+                            if 0 <= idx < len(P_np):
+                                ordered_values.append(int(P_np[idx]))
+                            else:
+                                ordered_values = None
+                                break
+                    if ordered_values:
+                        order_txt = (
+                            f" order={human_order}(P序=["
+                            + ",".join(str(val) for val in ordered_values)
+                            + "])"
+                        )
+                    else:
+                        order_txt = f" order={human_order}"
+                except Exception:
+                    order_txt = " order=?"
+            parts_disp = energy_disp or ""
+            unit = str(getattr(self.cfg.tightening_cfg, "angle_unit", "deg") or "deg")
+            angle_txt = ",".join(f"{a:.2f}" for a in angles)
+            postfix = (
+                f"theta=[{angle_txt}]{unit}{order_txt} Π={pin:.3e} | {parts_disp}{tight_txt} "
+                f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp} {vm_disp} {vm_ratio_disp}"
+            )
+            return postfix, "已记录"
+        except Exception:
+            return None, "记录异常"
+
+    # ----------------- 采样三螺栓预紧力 -----------------
+    def _sample_P(self) -> np.ndarray:
+        if self._preload_sequence:
+            if self._preload_current_target is None:
+                idx = self._preload_sequence_index
+                self._preload_current_target = self._preload_sequence[idx].copy()
+                base_order = (
+                    self._preload_sequence_orders[idx]
+                    if idx < len(self._preload_sequence_orders)
+                    else None
+                )
+                self._preload_current_order = (
+                    None if base_order is None else base_order.copy()
+                )
+            target = self._preload_current_target.copy()
+            current_order = (
+                None if self._preload_current_order is None else self._preload_current_order.copy()
+            )
+            jitter = float(self.cfg.preload_sequence_jitter or 0.0)
+            if jitter > 0.0:
+                noise = np.random.uniform(-jitter, jitter, size=target.shape)
+                target = target + noise.astype(np.float32)
+            lo, hi = self.cfg.preload_min, self.cfg.preload_max
+            target = np.clip(target, lo, hi)
+
+            self._preload_sequence_hold += 1
+            if self._preload_sequence_hold >= max(1, self.cfg.preload_sequence_repeat):
+                self._preload_sequence_hold = 0
+                self._preload_sequence_index = (self._preload_sequence_index + 1) % len(
+                    self._preload_sequence
+                )
+                if self._preload_sequence_index == 0 and self.cfg.preload_sequence_shuffle:
+                    perm = np.random.permutation(len(self._preload_sequence))
+                    self._preload_sequence = [self._preload_sequence[i] for i in perm]
+                    self._preload_sequence_orders = [
+                        self._preload_sequence_orders[i] if i < len(self._preload_sequence_orders) else None
+                        for i in perm
+                    ]
+                idx = self._preload_sequence_index
+                self._preload_current_target = self._preload_sequence[idx].copy()
+                base_order = (
+                    self._preload_sequence_orders[idx]
+                    if idx < len(self._preload_sequence_orders)
+                    else None
+                )
+                self._preload_current_order = (
+                    None if base_order is None else base_order.copy()
+                )
+
+            self._last_preload_order = None if current_order is None else current_order.copy()
+            return target.astype(np.float32)
+
+        lo, hi = self.cfg.preload_min, self.cfg.preload_max
+        nb = int(self._preload_dim)
+        repeat = max(1, int(getattr(self.cfg, "preload_sequence_repeat", 1) or 1))
+        if repeat > 1:
+            # Hold the same preload vector (and optionally the same tightening order)
+            # for a few consecutive optimization steps, so each sampled case has a
+            # chance to converge instead of being "seen once and forgotten".
+            if self._preload_current_target is None:
+                sampling = (self.cfg.preload_sampling or "uniform").lower()
+                if sampling == "lhs":
+                    out = self._next_lhs_preload(nb, lo, hi)
+                else:
+                    out = np.random.uniform(lo, hi, size=(nb,)).astype(np.float32)
+                self._preload_current_target = out.astype(np.float32).copy()
+
+                if self.cfg.preload_use_stages:
+                    if self.cfg.preload_randomize_order:
+                        self._preload_current_order = np.random.permutation(nb).astype(np.int32)
+                    else:
+                        self._preload_current_order = np.arange(nb, dtype=np.int32)
+                else:
+                    self._preload_current_order = None
+                self._preload_sequence_hold = 0
+
+            target = self._preload_current_target.copy()
+            current_order = (
+                None if self._preload_current_order is None else self._preload_current_order.copy()
+            )
+
+            self._preload_sequence_hold += 1
+            if self._preload_sequence_hold >= repeat:
+                self._preload_sequence_hold = 0
+                self._preload_current_target = None
+                self._preload_current_order = None
+
+            self._last_preload_order = None if current_order is None else current_order.copy()
+            return target.astype(np.float32)
+
+        sampling = (self.cfg.preload_sampling or "uniform").lower()
+        if sampling == "lhs":
+            out = self._next_lhs_preload(nb, lo, hi)
+        else:
+            out = np.random.uniform(lo, hi, size=(nb,)).astype(np.float32)
+        self._last_preload_order = None
+        return out.astype(np.float32)
+
+    def _normalize_order(self, order: Optional[Any], nb: int) -> Optional[np.ndarray]:
+        if order is None:
+            return None
+        arr = np.array(order, dtype=np.int32).reshape(-1)
+        if arr.size != nb:
+            raise ValueError(f"顺序长度需为 {nb}，收到 {arr.size}。")
+        if np.all(arr >= 1) and np.max(arr) <= nb and np.min(arr) >= 1:
+            arr = arr - 1
+        unique = sorted(set(arr.tolist()))
+        if unique != list(range(nb)):
+            raise ValueError(
+                f"顺序字段必须是 0~{nb-1}（或 1~{nb}）的排列，收到 {list(arr)}。"
+            )
+        return arr.astype(np.int32)
+
+    def _build_stage_case(self, P: np.ndarray, order: np.ndarray) -> Dict[str, np.ndarray]:
+        nb = int(P.shape[0])
+        order = np.asarray(order, dtype=np.int32).reshape(-1)
+        if order.size != nb:
+            raise ValueError(f"顺序长度需为 {nb}，收到 {order.size}。")
+        stage_loads = []
+        stage_masks = []
+        stage_last = []
+        cumulative = np.zeros_like(P)
+        mask = np.zeros_like(P)
+        rank = np.zeros((nb,), dtype=np.float32)
+        for pos, idx in enumerate(order):
+            idx_int = int(idx)
+            cumulative[idx_int] = P[idx_int]
+            mask[idx_int] = 1.0
+            stage_loads.append(cumulative.copy())
+            stage_masks.append(mask.copy())
+            onehot = np.zeros_like(P)
+            onehot[idx_int] = 1.0
+            stage_last.append(onehot)
+            rank[idx_int] = float(pos)
+
+        mode = str(getattr(self.cfg.total_cfg, "preload_stage_mode", "") or "")
+        mode = mode.strip().lower().replace("-", "_")
+        if mode == "force_then_lock":
+            # Append a final "release" stage so the last stage represents the post-tightening
+            # equilibrium (all bolts locked, no active force control). This is where tightening
+            # order effects should manifest most clearly.
+            stage_loads.append(cumulative.copy())
+            stage_masks.append(mask.copy())
+            stage_last.append(np.zeros_like(P))
+        if nb > 1:
+            rank = rank / float(nb - 1)
+        else:
+            rank = np.zeros_like(rank)
+        rank_matrix = np.tile(rank.reshape(1, -1), (len(stage_loads), 1))
+        return {
+            "stages": np.stack(stage_loads).astype(np.float32),
+            "stage_masks": np.stack(stage_masks).astype(np.float32),
+            "stage_last": np.stack(stage_last).astype(np.float32),
+            "stage_rank": rank.astype(np.float32),
+            "stage_rank_matrix": rank_matrix.astype(np.float32),
+        }
+
+    def _build_stage_tensors(
+        self, P: np.ndarray, order: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build staged tensors with stable [normP, mask, last, rank] features."""
+
+        P_arr = np.asarray(P, dtype=np.float32).reshape(-1)
+        nb = int(P_arr.shape[0])
+        order_arr = self._normalize_order(order, nb)
+        if order_arr is None:
+            order_arr = np.arange(nb, dtype=np.int32)
+        case = self._build_stage_case(P_arr, order_arr)
+        stage_p = np.asarray(case["stages"], dtype=np.float32)
+        stage_masks = np.asarray(case["stage_masks"], dtype=np.float32)
+        stage_last = np.asarray(case["stage_last"], dtype=np.float32)
+        rank = np.asarray(case["stage_rank"], dtype=np.float32).reshape((1, nb))
+        rank_matrix = np.repeat(rank, repeats=stage_p.shape[0], axis=0)
+
+        shift = float(getattr(self.cfg.model_cfg, "preload_shift", 0.0))
+        scale = float(getattr(self.cfg.model_cfg, "preload_scale", 1.0))
+        if not np.isfinite(scale) or abs(scale) < 1e-12:
+            scale = 1.0
+        norm = (stage_p - shift) / scale
+        stage_feat = np.concatenate([norm, stage_masks, stage_last, rank_matrix], axis=1)
+        return stage_p.astype(np.float32), stage_feat.astype(np.float32)
+
+    def _sample_preload_case(self) -> Dict[str, np.ndarray]:
+        P = self._sample_P()
+        case: Dict[str, np.ndarray] = {"P": P}
+        if not self.cfg.preload_use_stages:
+            return case
+
+        base_order = None if self._last_preload_order is None else self._last_preload_order.copy()
+        if base_order is None:
+            if self.cfg.preload_randomize_order:
+                order = np.random.permutation(P.shape[0]).astype(np.int32)
+            else:
+                order = np.arange(P.shape[0], dtype=np.int32)
+        else:
+            order = base_order.astype(np.int32)
+
+        case["order"] = order
+        case.update(self._build_stage_case(P, order))
+        return case
+
+    def _make_preload_params(self, case: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"P": tf.convert_to_tensor(case["P"], dtype=tf.float32)}
+        if not self.cfg.preload_use_stages or "stages" not in case:
+            return params
+
+        order_np = case.get("order")
+        if order_np is None:
+            order_np = np.arange(case["P"].shape[0], dtype=np.int32)
+        order_np = np.asarray(order_np, dtype=np.int32).reshape(-1)
+        stage_np, stage_feat_np = self._build_stage_tensors(case["P"], order_np)
+
+        masks = case.get("stage_masks")
+        lasts = case.get("stage_last")
+        if masks is None:
+            masks = np.zeros_like(stage_np, dtype=np.float32)
+        if lasts is None:
+            lasts = np.zeros_like(stage_np, dtype=np.float32)
+        masks = np.asarray(masks, dtype=np.float32)
+        lasts = np.asarray(lasts, dtype=np.float32)
+
+        rank_np = case.get("stage_rank")
+        if rank_np is None:
+            nb = int(stage_np.shape[1])
+            rank_raw = np.zeros((nb,), dtype=np.float32)
+            for pos, idx in enumerate(order_np):
+                rank_raw[int(idx)] = float(pos)
+            if nb > 1:
+                rank_raw = rank_raw / float(nb - 1)
+            rank_np = rank_raw.astype(np.float32)
+        rank_np = np.asarray(rank_np, dtype=np.float32).reshape(-1)
+
+        rank_matrix_np = case.get("stage_rank_matrix")
+        if rank_matrix_np is None:
+            rank_matrix_np = np.repeat(
+                rank_np.reshape(1, -1), repeats=stage_np.shape[0], axis=0
+            )
+        rank_matrix_np = np.asarray(rank_matrix_np, dtype=np.float32)
+
+        stage_count = int(stage_np.shape[0])
+        n_bolts = int(stage_np.shape[1])
+        stage_tensor_P = tf.convert_to_tensor(stage_np, dtype=tf.float32)
+        stage_tensor_P.set_shape((stage_count, n_bolts))
+        stage_tensor_feat = tf.convert_to_tensor(stage_feat_np, dtype=tf.float32)
+        stage_tensor_feat.set_shape((stage_count, 4 * n_bolts))
+        mask_tensor = tf.convert_to_tensor(masks, dtype=tf.float32)
+        mask_tensor.set_shape((stage_count, n_bolts))
+        last_tensor = tf.convert_to_tensor(lasts, dtype=tf.float32)
+        last_tensor.set_shape((stage_count, n_bolts))
+        rank_tf = tf.convert_to_tensor(rank_np, dtype=tf.float32)
+        rank_tf.set_shape((n_bolts,))
+        rank_matrix_tf = tf.convert_to_tensor(rank_matrix_np, dtype=tf.float32)
+        rank_matrix_tf.set_shape((stage_count, n_bolts))
+
+        params["stages"] = {
+            "P": stage_tensor_P,
+            "P_hat": stage_tensor_feat,
+            "stage_mask": mask_tensor,
+            "stage_last": last_tensor,
+            "stage_rank": rank_matrix_tf,
+        }
+        params["stage_order"] = tf.convert_to_tensor(order_np, dtype=tf.int32)
+        params["stage_rank"] = rank_tf
+        params["stage_count"] = tf.constant(stage_count, dtype=tf.int32)
+        return params
+
+    @staticmethod
+    def _static_last_dim(arr: Any) -> Optional[int]:
+        try:
+            dim = getattr(arr, "shape", None)
+            if dim is None:
+                return None
+            last = dim[-1]
+            return None if last is None else int(last)
+        except Exception:
+            return None
+
+    def _infer_preload_feat_dim(self, params: Dict[str, Any]) -> Optional[int]:
+        """静态推断 P_hat 的长度；优先 staged 特征，其次单步 P_hat/P。"""
+
+        if not isinstance(params, dict):
+            return None
+
+        stages = params.get("stages")
+        if isinstance(stages, dict):
+            feat = stages.get("P_hat")
+            dim = self._static_last_dim(feat)
+            if dim:
+                return dim
+
+        if "P_hat" in params:
+            dim = self._static_last_dim(params.get("P_hat"))
+            if dim:
+                return dim
+
+        return self._static_last_dim(params.get("P"))
+
+    def _extract_final_stage_params(
+        self, params: Dict[str, Any], keep_context: bool = False
+    ) -> Dict[str, Any]:
+        """Return the last staged parameter set, optionally carrying context."""
+
+        if not (
+            self.cfg.preload_use_stages
+            and isinstance(params, dict)
+            and "stages" in params
+        ):
+            return params
+
+        stages = params["stages"]
+        final: Optional[Dict[str, tf.Tensor]] = None
+        if isinstance(stages, dict) and stages:
+            last_P = stages.get("P")
+            last_feat = stages.get("P_hat")
+            if last_P is not None and last_feat is not None:
+                final = {"P": last_P[-1], "P_hat": last_feat[-1]}
+                rank_tensor = stages.get("stage_rank")
+                if rank_tensor is not None:
+                    if getattr(rank_tensor, "shape", None) is not None and rank_tensor.shape.rank == 2:
+                        final["stage_rank"] = rank_tensor[-1]
+                    else:
+                        final["stage_rank"] = rank_tensor
+        elif isinstance(stages, (list, tuple)) and stages:
+            last_stage = stages[-1]
+            if isinstance(last_stage, dict):
+                final = dict(last_stage)
+            else:
+                p_val, z_val = last_stage
+                final = {"P": p_val, "P_hat": z_val}
+
+        if final is None:
+            return params
+
+        if keep_context:
+            for key in (
+                "stage_order",
+                "stage_rank",
+                "stage_count",
+                "stage_mask",
+                "stage_last",
+                "train_progress",
+            ):
+                if key in params and key not in final:
+                    final[key] = params[key]
+        return final
+
+    def _extract_stage_params(
+        self, params: Dict[str, Any], stage_index: int, keep_context: bool = False
+    ) -> Dict[str, Any]:
+        """Return the indexed staged parameter set (0-based), optionally carrying context."""
+
+        if not (
+            self.cfg.preload_use_stages
+            and isinstance(params, dict)
+            and "stages" in params
+        ):
+            return params
+
+        stages = params["stages"]
+        out: Optional[Dict[str, Any]] = None
+        if isinstance(stages, dict) and stages:
+            stage_P = stages.get("P")
+            stage_feat = stages.get("P_hat")
+            if stage_P is not None and stage_feat is not None:
+                stage_count = 0
+                try:
+                    stage_count = int(stage_P.shape[0])
+                except Exception:
+                    stage_count = 0
+                if stage_count <= 0:
+                    stage_count = int(tf.shape(stage_P)[0].numpy())
+                idx = stage_index % stage_count
+                out = {"P": stage_P[idx], "P_hat": stage_feat[idx]}
+
+                rank_tensor = stages.get("stage_rank")
+                if rank_tensor is not None:
+                    if getattr(rank_tensor, "shape", None) is not None and rank_tensor.shape.rank == 2:
+                        out["stage_rank"] = rank_tensor[idx]
+                    else:
+                        out["stage_rank"] = rank_tensor
+
+                mask_tensor = stages.get("stage_mask")
+                if mask_tensor is not None and getattr(mask_tensor, "shape", None) is not None and mask_tensor.shape.rank == 2:
+                    out["stage_mask"] = mask_tensor[idx]
+
+                last_tensor = stages.get("stage_last")
+                if last_tensor is not None and getattr(last_tensor, "shape", None) is not None and last_tensor.shape.rank == 2:
+                    out["stage_last"] = last_tensor[idx]
+        elif isinstance(stages, (list, tuple)) and stages:
+            idx = stage_index % len(stages)
+            stage_item = stages[idx]
+            if isinstance(stage_item, dict):
+                out = dict(stage_item)
+            else:
+                p_val, z_val = stage_item
+                out = {"P": p_val, "P_hat": z_val}
+
+        if out is None:
+            return params
+
+        if keep_context:
+            for key in (
+                "stage_order",
+                "stage_rank",
+                "stage_count",
+                "train_progress",
+            ):
+                if key in params and key not in out:
+                    out[key] = params[key]
+        return out
+
+    def _get_stage_count(self, params: Dict[str, Any]) -> int:
+        """Infer stage count from params; falls back to 1."""
+        if not (self.cfg.preload_use_stages and isinstance(params, dict) and "stages" in params):
+            return 1
+        stages = params["stages"]
+        if isinstance(stages, dict) and stages:
+            stage_P = stages.get("P")
+            if stage_P is not None:
+                try:
+                    return int(stage_P.shape[0])
+                except Exception:
+                    try:
+                        return int(tf.shape(stage_P)[0].numpy())
+                    except Exception:
+                        return 1
+        if isinstance(stages, (list, tuple)):
+            return max(1, len(stages))
+        return 1
+
+    def _active_stage_count(self, step: Optional[int], stage_count: int) -> int:
+        """Determine how many stages to include based on a schedule."""
+        if step is None or stage_count <= 1:
+            return stage_count
+        schedule = getattr(self.cfg, "stage_schedule_steps", None) or []
+        if not schedule or len(schedule) < stage_count:
+            return stage_count
+        cum = 0
+        for idx, span in enumerate(schedule[:stage_count]):
+            try:
+                span_i = int(span)
+            except Exception:
+                span_i = 0
+            if span_i <= 0:
+                continue
+            cum += span_i
+            if step <= cum:
+                return idx + 1
+        return stage_count
+
+    def _make_warmup_case(self) -> Dict[str, np.ndarray]:
+        mid = 0.5 * (float(self.cfg.preload_min) + float(self.cfg.preload_max))
+        base = np.full((3,), mid, dtype=np.float32)
+        case: Dict[str, np.ndarray] = {"P": base}
+        if self.cfg.preload_use_stages:
+            order = np.arange(base.shape[0], dtype=np.int32)
+            case["order"] = order
+            case.update(self._build_stage_case(base, order))
+        return case
+
+    # ----------------- 从 INP/Assembly 尝试自动发现接触对 -----------------
+    def _autoguess_contacts_from_inp(self, asm: AssemblyModel) -> List[Dict[str, str]]:
+        candidates = []
+        try:
+            # 0) 直接读取 asm.contact_pairs（通常是 ContactPair dataclass 列表）
+            raw = getattr(asm, "contact_pairs", None)
+            cand = self._normalize_pairs(raw)
+            if cand:
+                return cand
+
+            # 1) 若模型实现了 autoguess_contact_pairs()
+            if hasattr(asm, "autoguess_contact_pairs") and callable(asm.autoguess_contact_pairs):
+                pairs = asm.autoguess_contact_pairs()
+                cand = self._normalize_pairs(pairs)
+                if cand:
+                    return cand
+
+            # 2) 兜底：常见属性名
+            for attr in ["contacts", "contact_pairs", "interactions", "contact", "pairs"]:
+                obj = getattr(asm, attr, None)
+                cand = self._normalize_pairs(obj)
+                if cand:
+                    candidates.extend(cand)
+
+            # 去重
+            unique, seen = [], set()
+            for d in candidates:
+                key = (d.get("master_key"), d.get("slave_key"))
+                if key not in seen and all(key):
+                    unique.append(d);
+                    seen.add(key)
+            return unique
+        except Exception:
+            return []
+
+    @staticmethod
+    def _normalize_pairs(obj: Any) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        if obj is None:
+            return out
+        # 统一成可迭代
+        seq = obj
+        if isinstance(obj, dict):
+            seq = [obj]
+        elif not isinstance(obj, (list, tuple)):
+            seq = [obj]
+
+        for item in seq:
+            # 1) 显式 (master, slave)
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                m, s = item[0], item[1]
+                out.append({"master_key": str(m), "slave_key": str(s)})
+                continue
+            # 2) dict
+            if isinstance(item, dict):
+                keys = {k.lower(): v for k, v in item.items()}
+                m = keys.get("master_key") or keys.get("master") or keys.get("a")
+                s = keys.get("slave_key") or keys.get("slave") or keys.get("b")
+                if m and s:
+                    out.append({"master_key": str(m), "slave_key": str(s)})
+                continue
+            # 3) dataclass / 任意对象：有 .master / .slave 属性即可
+            m = getattr(item, "master", None)
+            s = getattr(item, "slave", None)
+            if m is not None and s is not None:
+                out.append({"master_key": str(m), "slave_key": str(s)})
+                continue
+        return out
+
+    # ----------------- Build -----------------
+    def build(self):
+        cfg = self.cfg
+
+        def _raise_vol_error(enum_names, X_vol, w_vol, mat_id):
+            enum_str = ", ".join(f"{i}->{n}" for i, n in enumerate(enum_names))
+            shapes = dict(
+                X_vol=None if X_vol is None else tuple(getattr(X_vol, "shape", [])),
+                w_vol=None if w_vol is None else tuple(getattr(w_vol, "shape", [])),
+                mat_id=None if mat_id is None else tuple(getattr(mat_id, "shape", [])),
+            )
+            msg = (
+                "\n[trainer] ERROR: build_volume_points 未返回有效体积分点；训练终止。\n"
+                f"  - 材料枚举(按 part2mat 顺序)：{enum_str}\n"
+                f"  - 返回 shapes: {shapes}\n"
+                "  - 常见原因：\n"
+                "      * INP 中的零件名与 part2mat 的键不一致（大小写/空格）。\n"
+                "      * 材料名不在 materials 字典里。\n"
+                "      * 网格上没有体积分点（或被过滤为空）。\n"
+                "  - 建议：检查 INP 的 part2mat 配置与网格数据，确保体积分点和材料映射正确生成。\n"
+            )
+            raise RuntimeError(msg)
+
+        steps = [
+            "Load Mesh", "Volume/Materials", "Elasticity",
+            "Contact", "Tightening", "Ties/BCs",
+            "Model/Opt", "Checkpoint"
+        ]
+
+        print(f"[INFO] Build.start  mesh_path={cfg.inp_path}")
+
+        pb_kwargs = dict(total=len(steps), desc="Build", leave=True)
+        if cfg.build_bar_color:
+            pb_kwargs["colour"] = cfg.build_bar_color
+        with tqdm(**pb_kwargs) as pb:
+            # 1) Mesh (INP/CDB)
+            ext = os.path.splitext(cfg.inp_path)[1].lower()
+            if ext == ".cdb":
+                self.asm = load_cdb(cfg.inp_path)
+                mesh_tag = "CDB"
+            else:
+                self.asm = load_inp(cfg.inp_path)
+                mesh_tag = "INP"
+            print(f"[INFO] Loaded {mesh_tag}: surfaces={len(self.asm.surfaces)} "
+                  f"elsets={len(self.asm.elsets)} contact_pairs(raw)={len(getattr(self.asm, 'contact_pairs', []))}")
+            pb.update(1)
+
+            # 2) 体积分点 & 材料映射（严格检查）
+            self.matlib = MaterialLibrary(cfg.materials)
+            X_vol, w_vol, mat_id = build_volume_points(self.asm, cfg.part2mat, self.matlib)
+
+            enum_names = list(dict.fromkeys(cfg.part2mat.values()))
+            enum_str = ", ".join(f"{i}->{n}" for i, n in enumerate(enum_names))
+            print(f"[trainer] Material enum (from part2mat order): {enum_str}")
+
+            # —— 严格检查
+            if X_vol is None or w_vol is None or mat_id is None:
+                _raise_vol_error(enum_names, X_vol, w_vol, mat_id)
+
+            n = getattr(X_vol, "shape", [0])[0]
+            if getattr(w_vol, "shape", [0])[0] != n or getattr(mat_id, "shape", [0])[0] != n or n == 0:
+                _raise_vol_error(enum_names, X_vol, w_vol, mat_id)
+
+            # —— 暴露到 Trainer
+            self.X_vol = X_vol
+            self.w_vol = w_vol
+            self.mat_id = mat_id
+            self.enum_names = enum_names
+            def _extract_E_nu(tag: str, spec: Any) -> Tuple[float, float]:
+                if isinstance(spec, (tuple, list)) and len(spec) >= 2:
+                    return float(spec[0]), float(spec[1])
+                if isinstance(spec, dict):
+                    return float(spec["E"]), float(spec["nu"])
+                raise TypeError(
+                    f"[trainer] Material '{tag}' spec must be (E, nu) or dict with keys 'E'/'nu', got {type(spec)}"
+                )
+
+            self.id2props_map = {
+                i: _extract_E_nu(name, cfg.materials[name]) for i, name in enumerate(enum_names)
+            }
+
+            pb.update(1)
+
+            # 3) 弹性项 —— 改为 DFEM 构造方式
+            # 注意：X_vol / w_vol / mat_id 依然保留在 Trainer 里用于可视化与检查，
+            # 但不再传进 ElasticityEnergy，DFEM 内部自己做子单元积分。
+            self.elasticity = ElasticityEnergy(
+                asm=self.asm,
+                part2mat=cfg.part2mat,
+                materials=cfg.materials,
+                cfg=cfg.elas_cfg,
+            )
+            pb.update(1)
+            
+            # DFEM integration: update model config with n_nodes from elasticity
+            if hasattr(cfg, 'model_cfg') and hasattr(cfg.model_cfg, 'field'):
+                if getattr(cfg.model_cfg.field, 'dfem_mode', False):
+                    n_nodes = self.elasticity.n_nodes
+                    cfg.model_cfg.field.n_nodes = n_nodes
+                    print(f"[trainer] DFEM mode: set n_nodes={n_nodes} from ElasticityEnergy")
+
+            # 4) 接触（优先使用 cfg；否则尝试自动探测）
+            self._cp_specs = []
+            contact_source = ""
+            if cfg.contact_pairs:
+                try:
+                    self._cp_specs = [ContactPairSpec(**d) for d in cfg.contact_pairs]
+                except TypeError:
+                    norm = self._normalize_pairs(cfg.contact_pairs)
+                    self._cp_specs = [ContactPairSpec(**d) for d in norm] if norm else []
+                contact_source = "配置"
+            else:
+                auto_pairs = self._autoguess_contacts_from_inp(self.asm)
+                if auto_pairs:
+                    self._cp_specs = [ContactPairSpec(**d) for d in auto_pairs]
+                    contact_source = "自动识别"
+
+            self.contact = None
+            if self._cp_specs:
+                try:
+                    cmap = build_contact_map(
+                        self.asm,
+                        self._cp_specs,
+                        cfg.n_contact_points_per_pair,
+                        seed=cfg.contact_seed,
+                    )
+                    cat = cmap.concatenate()
+                    self.contact = ContactOperator(cfg.contact_cfg)
+                    self.contact.build_from_cat(cat, extra_weights=None, auto_orient=True)
+                    self._current_contact_cat = cat
+                    self._contact_rar_cache = None
+                    self._init_contact_hardening()
+                    total_pts = len(cmap)
+                    src_txt = f"（{contact_source}）" if contact_source else ""
+                    print(
+                        f"[contact] 已加载 {len(self._cp_specs)} 对接触面{src_txt}，"
+                        f"采样 {total_pts} 个点。"
+                    )
+                except Exception as exc:
+                    print(f"[contact] 构建接触失败：{exc}")
+                    self.contact = None
+            else:
+                print("[contact] 未找到接触信息，训练将不启用接触。")
+
+            pb.update(1)
+
+            # 5) 螺母拧紧（旋转角）
+            if cfg.preload_specs:
+                try:
+                    specs = [NutSpec(**d) for d in cfg.preload_specs]
+                    self.tightening = NutTighteningPenalty(cfg.tightening_cfg)
+                    self.tightening.build_from_specs(
+                        self.asm,
+                        specs,
+                        n_points_each=cfg.preload_n_points_each,
+                        seed=cfg.seed,
+                    )
+                    print(f"[tightening] 已配置 {len(specs)} 个螺母表面样本。")
+                except Exception as exc:
+                    print(f"[tightening] 构建拧紧样本失败：{exc}")
+                    self.tightening = None
+            else:
+                self.tightening = None
+                print("[tightening] 未提供螺母拧紧配置。")
+            pb.update(1)
+
+            # 6) Ties/BCs（如需，可在 cfg 里填充）
+            self.ties_ops, self.bcs_ops = [], []
+            pb.update(1)
+
+            # 6.5) 根据预紧特征维度统一 ParamEncoder 输入形状，避免 staged 特征长度变化
+            self._warmup_case = self._make_warmup_case()
+            self._warmup_params = self._make_preload_params(self._warmup_case)
+            feat_dim = self._infer_preload_feat_dim(self._warmup_params)
+            if feat_dim:
+                old_dim = getattr(cfg.model_cfg.encoder, "in_dim", None)
+                if old_dim != feat_dim:
+                    print(
+                        f"[model] 预紧特征维度 {old_dim} -> {feat_dim}，统一 ParamEncoder 输入。"
+                    )
+                    cfg.model_cfg.encoder.in_dim = feat_dim
+
+            # 7) 模型 & 优化器
+            if cfg.mixed_precision:
+                cfg.model_cfg.mixed_precision = cfg.mixed_precision
+            self.model = create_displacement_model(cfg.model_cfg)
+            self._apply_model_contact_context(self._current_contact_cat, reason="build")
+            
+            # Pre-build adjacency using mesh node coordinates (recommended for DFEM energy:
+            # ElasticityEnergy evaluates u on all nodes every step; caching avoids rebuilding kNN each call).
+            if hasattr(self, "elasticity") and self.elasticity is not None:
+                try:
+                    X_nodes = self.elasticity.X_nodes_tf
+                    self.model.field.prebuild_adjacency(X_nodes)
+                except Exception as exc:
+                    print(f"[trainer] WARNING: 预构建全局邻接失败，将退回动态构图：{exc}")
+                    
+            # Legacy graph precompute (for non-DFEM mode)
+            if getattr(cfg.model_cfg.field, "graph_precompute", False) and getattr(self, "elasticity", None):
+                try:
+                    self.model.field.set_global_graph(self.elasticity.X_nodes_tf)
+                    print(
+                        f"[graph] 已预计算全局 kNN 邻接: N={getattr(self.elasticity, 'n_nodes', '?')} k={cfg.model_cfg.field.graph_k}"
+                    )
+                except Exception as exc:
+                    print(f"[graph] 预计算全局邻接失败，将退回动态构图：{exc}")
+            base_optimizer = tf.keras.optimizers.Adam(cfg.lr)
+            mp_policy = str(cfg.mixed_precision or "").strip().lower()
+            use_loss_scale = mp_policy.startswith("mixed_")
+            if use_loss_scale:
+                base_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
+                print("[trainer] 已启用 LossScaleOptimizer 以配合混合精度训练。")
+            self.optimizer = base_optimizer
+            pb.update(1)
+
+            # 8) checkpoint
+            self.ckpt = tf.train.Checkpoint(
+                encoder=self.model.encoder,
+                field=self.model.field,
+                opt=self.optimizer,
+            )
+            self.ckpt_manager = tf.train.CheckpointManager(
+                self.ckpt, directory=cfg.ckpt_dir, max_to_keep=int(cfg.ckpt_max_to_keep)
+            )
+            pb.update(1)
+
+        # 预热网络，确保所有权重在进入梯度带之前已创建，从而可以被显式 watch
+        try:
+            warmup_n = min(2048, int(self.X_vol.shape[0])) if hasattr(self, "X_vol") else 0
+        except Exception:
+            warmup_n = 0
+        if warmup_n > 0:
+            X_sample = tf.convert_to_tensor(self.X_vol[:warmup_n], dtype=tf.float32)
+            params = self._warmup_params or self._make_preload_params(self._make_warmup_case())
+            eval_params = self._extract_final_stage_params(params)
+            # 调用一次前向以创建所有变量；忽略实际输出
+            _ = self.model.u_fn(X_sample, eval_params)
+
+        self._train_vars = (
+            list(self.model.encoder.trainable_variables)
+            + list(self.model.field.trainable_variables)
+        )
+        if not self._train_vars:
+            raise RuntimeError(
+                "[trainer] 未发现可训练权重，请检查模型创建/预热流程是否成功。"
+            )
+
+        print(f"[trainer] GPU allocator = {os.environ.get('TF_GPU_ALLOCATOR', '(default)')}")
+        print(
+            f"[contact] 状态：{'已启用' if self.contact is not None else '未启用'}"
+        )
+        print(
+            f"[tightening] 状态：{'已启用' if self.tightening is not None else '未启用'}"
+        )
+
+    # ----------------- 组装总能量 -----------------
+    def _assemble_total(self) -> TotalEnergy:
+        total = TotalEnergy(self.cfg.total_cfg)
+        total.attach(
+            elasticity=self.elasticity,
+            contact=self.contact,
+            preload=None,
+            tightening=self.tightening,
+            ties=self.ties_ops,
+            bcs=self.bcs_ops,
+        )
+        return total
+
+    # ----------------- Contact hardening schedule -----------------
+
+    def _init_contact_hardening(self):
+        """Initialise soft→hard schedule targets and apply soft start values."""
+
+        if self.contact is None or not self.cfg.contact_hardening_enabled:
+            self._contact_hardening_targets = None
+            return
+
+        def _to_float(x, fallback: float) -> float:
+            try:
+                if hasattr(x, "numpy"):
+                    return float(x.numpy())
+                return float(x)
+            except Exception:
+                return float(fallback)
+
+        # Target (hard) values from config / operator
+        beta_t = _to_float(getattr(self.contact.normal, "beta", None), self.cfg.contact_cfg.normal.beta)
+        mu_n_t = _to_float(getattr(self.contact.normal, "mu_n", None), self.cfg.contact_cfg.normal.mu_n)
+        k_t_t = _to_float(getattr(self.contact.friction, "k_t", None), self.cfg.contact_cfg.friction.k_t)
+        mu_t_t = _to_float(getattr(self.contact.friction, "mu_t", None), self.cfg.contact_cfg.friction.mu_t)
+
+        # Soft start values (user override or 20% of target)
+        beta_s = float(self.cfg.contact_beta_start) if self.cfg.contact_beta_start is not None else 0.2 * beta_t
+        mu_n_s = float(self.cfg.contact_mu_n_start) if self.cfg.contact_mu_n_start is not None else 0.2 * mu_n_t
+        k_t_s = float(self.cfg.friction_k_t_start) if self.cfg.friction_k_t_start is not None else 0.2 * k_t_t
+        mu_t_s = float(self.cfg.friction_mu_t_start) if self.cfg.friction_mu_t_start is not None else 0.2 * mu_t_t
+
+        beta_s = max(beta_s, 1e-6)
+        mu_n_s = max(mu_n_s, 1e-6)
+        k_t_s = max(k_t_s, 0.0)
+        mu_t_s = max(mu_t_s, 1e-6)
+
+        # Apply soft start to operator variables
+        try:
+            self.contact.normal.beta.assign(beta_s)
+            self.contact.normal.mu_n.assign(mu_n_s)
+            self.contact.friction.k_t.assign(k_t_s)
+            self.contact.friction.mu_t.assign(mu_t_s)
+        except Exception:
+            pass
+
+        self._contact_hardening_targets = {
+            "beta_start": beta_s,
+            "beta_target": beta_t,
+            "mu_n_start": mu_n_s,
+            "mu_n_target": mu_n_t,
+            "k_t_start": k_t_s,
+            "k_t_target": k_t_t,
+            "mu_t_start": mu_t_s,
+            "mu_t_target": mu_t_t,
+        }
+        print(
+            "[contact] soft→hard schedule init: "
+            f"beta {beta_s:g}->{beta_t:g}, mu_n {mu_n_s:g}->{mu_n_t:g}, "
+            f"k_t {k_t_s:g}->{k_t_t:g}, mu_t {mu_t_s:g}->{mu_t_t:g}"
+        )
+
+    def _maybe_update_contact_hardening(self, step: int):
+        """Update contact penalty/ALM parameters according to training progress."""
+
+        if self._contact_hardening_targets is None or self.contact is None:
+            return
+        frac = float(np.clip(self.cfg.contact_hardening_fraction, 0.0, 1.0))
+        if frac <= 0.0:
+            return
+        ramp_steps = max(1, int(frac * max(1, self.cfg.max_steps)))
+        t = min(1.0, float(step) / float(ramp_steps))
+        # Smooth cosine ramp
+        s = 0.5 - 0.5 * math.cos(math.pi * t)
+
+        def _lerp(a: float, b: float) -> float:
+            return a + (b - a) * s
+
+        beta = _lerp(self._contact_hardening_targets["beta_start"], self._contact_hardening_targets["beta_target"])
+        mu_n = _lerp(self._contact_hardening_targets["mu_n_start"], self._contact_hardening_targets["mu_n_target"])
+        k_t = _lerp(self._contact_hardening_targets["k_t_start"], self._contact_hardening_targets["k_t_target"])
+        mu_t = _lerp(self._contact_hardening_targets["mu_t_start"], self._contact_hardening_targets["mu_t_target"])
+
+        try:
+            self.contact.normal.beta.assign(beta)
+            self.contact.normal.mu_n.assign(mu_n)
+            self.contact.friction.k_t.assign(k_t)
+            self.contact.friction.mu_t.assign(mu_t)
+        except Exception:
+            pass
+
+    def _maybe_update_friction_smoothing(self, step: int):
+        """Switch friction energy from smooth to strict according to schedule."""
+
+        if self.contact is None or not self.cfg.friction_smooth_schedule:
+            return
+        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
+        if loss_mode in {"residual", "residual_only", "res"}:
+            return
+
+        smooth_steps = self.cfg.friction_smooth_steps
+        if smooth_steps is None or smooth_steps <= 0:
+            frac = float(np.clip(self.cfg.friction_smooth_fraction, 0.0, 1.0))
+            smooth_steps = int(max(0, frac * max(1, self.cfg.max_steps)))
+
+        blend_steps = self.cfg.friction_blend_steps
+        if blend_steps is None or blend_steps < 0:
+            blend_steps = 0
+
+        if smooth_steps <= 0:
+            blend = 0.0
+        elif step <= smooth_steps:
+            blend = 1.0
+        elif blend_steps > 0 and step <= smooth_steps + blend_steps:
+            t = float(step - smooth_steps) / float(blend_steps)
+            blend = max(0.0, min(1.0, 1.0 - t))
+        else:
+            blend = 0.0
+
+        if blend >= 0.999:
+            mode = "smooth"
+        elif blend <= 0.001:
+            mode = "strict"
+        else:
+            mode = "blend"
+
+        if self._friction_smooth_state is not None and mode == self._friction_smooth_state:
+            # still update blend value even if mode unchanged
+            pass
+
+        self._friction_smooth_state = mode
+        try:
+            use_smooth = blend > 0.0
+            if hasattr(self.contact.friction, "set_smooth_friction"):
+                self.contact.friction.set_smooth_friction(use_smooth)
+            else:
+                self.contact.friction.cfg.use_smooth_friction = use_smooth
+            if hasattr(self.contact.friction, "set_smooth_blend"):
+                self.contact.friction.set_smooth_blend(blend)
+            else:
+                self.contact.friction.cfg.smooth_blend = float(blend)
+            self.contact.cfg.use_smooth_friction = use_smooth
+        except Exception:
+            pass
+
+        if mode == "blend":
+            print(f"[friction] 切换摩擦能量路径: blend ({blend:.2f}) (step {step})")
+        else:
+            print(f"[friction] 切换摩擦能量路径: {mode} (step {step})")
+
+    # ----------------- Contact-driven RAR -----------------
+
+    def _update_contact_rar_cache(self):
+        """Cache残差信息，供下一次接触重采样时做重要性抽样。"""
+
+        if not self.cfg.contact_rar_enabled:
+            self._contact_rar_cache = None
+            return
+        if self.contact is None or self._current_contact_cat is None:
+            self._contact_rar_cache = None
+            return
+
+        metrics = self.contact.last_sample_metrics()
+        if not metrics:
+            self._contact_rar_cache = None
+            return
+
+        imp: Optional[np.ndarray] = None
+        if "gap" in metrics:
+            # Use the same smooth negative-part as the normal ALM (softplus),
+            # so near-contact (g≈0) points also get nonzero importance.
+            gap = np.asarray(metrics["gap"], dtype=np.float64).reshape(-1)
+            beta = None
+            try:
+                beta_var = getattr(getattr(self.contact, "normal", None), "beta", None)
+                if beta_var is not None and hasattr(beta_var, "numpy"):
+                    beta = float(beta_var.numpy())
+            except Exception:
+                beta = None
+            if beta is None:
+                try:
+                    beta = float(getattr(getattr(self.cfg, "contact_cfg", None), "normal", None).beta)  # type: ignore[attr-defined]
+                except Exception:
+                    beta = 50.0
+            beta = float(max(beta, 1e-6))
+            x = -beta * gap
+            phi = np.empty_like(gap, dtype=np.float64)
+            large = x > 50.0
+            phi[large] = x[large] / beta
+            phi[~large] = np.log1p(np.exp(x[~large])) / beta
+            imp = phi.astype(np.float32)
+        if "fric_res" in metrics:
+            fr = np.abs(metrics["fric_res"])
+            if imp is None:
+                imp = fr
+            else:
+                alpha = float(np.clip(self.cfg.contact_rar_fric_mix, 0.0, 1.0))
+                imp = (1.0 - alpha) * imp + alpha * fr
+
+        if imp is None or imp.size == 0:
+            self._contact_rar_cache = None
+            return
+
+        imp = np.where(np.isfinite(imp), imp, 0.0)
+        # Clip extreme outliers to avoid a few samples dominating RAR.
+        try:
+            finite_imp = imp[np.isfinite(imp)]
+            if finite_imp.size > 0:
+                hi = float(np.quantile(finite_imp, 0.99))
+                if hi > 0:
+                    imp = np.minimum(imp, hi)
+        except Exception:
+            pass
+        self._contact_rar_cache = {
+            "importance": imp,
+            "cat": self._current_contact_cat,
+            "meta": self.contact.last_meta(),
+        }
+
+    def _maybe_apply_contact_rar(
+        self, cat_uniform: Dict[str, np.ndarray], step_index: int
+    ) -> Tuple[Dict[str, np.ndarray], str]:
+        """
+        将上一批接触残差转化为重要性抽样，混合到本次接触样本中。
+
+        Returns
+        -------
+        cat_new : dict
+            可能重排/混合后的 contact cat。
+        note : str
+            用于进度条/日志的附加说明。
+        """
+
+        if (
+            not self.cfg.contact_rar_enabled
+            or self._contact_rar_cache is None
+            or self._contact_rar_cache.get("cat") is None
+        ):
+            return cat_uniform, ""
+
+        source_cat: Dict[str, np.ndarray] = self._contact_rar_cache.get("cat", {})
+        importance: Optional[np.ndarray] = self._contact_rar_cache.get("importance")
+        if importance is None or importance.shape[0] != source_cat.get("xs", np.zeros((0, 3))).shape[0]:
+            return cat_uniform, ""
+
+        total_n = int(cat_uniform.get("xs", np.zeros((0, 3))).shape[0])
+        if total_n == 0:
+            return cat_uniform, ""
+
+        rar_frac = float(np.clip(self.cfg.contact_rar_fraction, 0.0, 1.0))
+        min_uniform = int(np.round(total_n * np.clip(self.cfg.contact_rar_uniform_ratio, 0.0, 1.0)))
+        n_rar = int(np.round(total_n * rar_frac))
+        if n_rar + min_uniform > total_n:
+            n_rar = max(0, total_n - min_uniform)
+        n_uniform = max(0, total_n - n_rar)
+        if n_rar <= 0:
+            return cat_uniform, ""
+
+        temp = max(self.cfg.contact_rar_temperature, 1e-6)
+        weights = np.power(importance + self.cfg.contact_rar_floor, 1.0 / temp)
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        if float(weights.sum()) <= 0.0:
+            return cat_uniform, ""
+
+        rng = np.random.default_rng(self.cfg.contact_seed + step_index * 17)
+        pair_ids = None
+        meta = self._contact_rar_cache.get("meta") or {}
+        if meta:
+            pair_ids = meta.get("pair_id")
+        if pair_ids is None:
+            pair_ids = source_cat.get("pair_id")
+
+        rar_indices: List[int] = []
+        if self.cfg.contact_rar_balance_pairs and pair_ids is not None:
+            pair_ids = np.asarray(pair_ids).reshape(-1)
+            total_src = max(1, pair_ids.shape[0])
+            for pid in np.unique(pair_ids):
+                mask = pair_ids == pid
+                if not np.any(mask):
+                    continue
+                quota = int(np.round(n_rar * float(mask.sum()) / float(total_src)))
+                quota = max(1 if n_rar > 0 else 0, quota)
+                probs = weights[mask]
+                probs = probs / (probs.sum() + 1e-12)
+                candidates = np.flatnonzero(mask)
+                rar_indices.extend(list(rng.choice(candidates, size=quota, replace=True, p=probs)))
+            if len(rar_indices) > n_rar:
+                rar_indices = rar_indices[:n_rar]
+        else:
+            probs = weights / (weights.sum() + 1e-12)
+            rar_indices = list(rng.choice(weights.shape[0], size=n_rar, replace=True, p=probs))
+
+        if not rar_indices:
+            return cat_uniform, ""
+
+        rar_indices = np.asarray(rar_indices, dtype=np.int64)
+        if rar_indices.shape[0] < n_rar:
+            rar_indices = rng.choice(rar_indices, size=n_rar, replace=True)
+
+        uni_indices = np.arange(cat_uniform["xs"].shape[0])
+        if n_uniform < uni_indices.shape[0]:
+            uni_indices = rng.choice(uni_indices, size=n_uniform, replace=False)
+
+        cat_new: Dict[str, np.ndarray] = {}
+        for key, arr in cat_uniform.items():
+            src_arr = source_cat.get(key, arr)
+            rar_part = src_arr[rar_indices] if rar_indices.size > 0 else src_arr[:0]
+            uni_part = arr[uni_indices] if n_uniform > 0 else arr[:0]
+            cat_new[key] = np.concatenate([rar_part, uni_part], axis=0)
+
+        note = f"RAR {len(rar_indices)}/{total_n}"
+        return cat_new, note
+
+    def _resample_contact(self, step_index: int) -> str:
+        """Resample contact points and rebuild the contact operator."""
+        if self.contact is None:
+            self._contact_rar_cache = None
+            return "skip (no contact)"
+        try:
+            cmap = resample_contact_map(
+                self.asm,
+                self._cp_specs,
+                self.cfg.n_contact_points_per_pair,
+                base_seed=self.cfg.contact_seed,
+                step_index=step_index,
+            )
+            cat_uniform = cmap.concatenate()
+            cat, rar_note = self._maybe_apply_contact_rar(cat_uniform, step_index)
+            self.contact.reset_for_new_batch()
+            self.contact.build_from_cat(cat, extra_weights=None, auto_orient=True)
+            self._current_contact_cat = cat
+            self._apply_model_contact_context(cat, reason="resample")
+            note = f"更新 {len(cmap)} 点"
+            if rar_note:
+                note += f" | {rar_note}"
+            return note
+        except Exception as exc:
+            self._contact_rar_cache = None
+            print(f"[contact] 重采样失败: {exc}")
+            return "更新失败"
+
+    # ----------------- Volume (strain energy) RAR -----------------
+
+    def _update_volume_rar_cache(self):
+        """基于上一批次的应变能密度，构造体积分点的重要性分布。"""
+
+        if not self.cfg.volume_rar_enabled:
+            self._volume_rar_cache = None
+            return
+        if self.elasticity is None:
+            self._volume_rar_cache = None
+            return
+        if not hasattr(self.elasticity, "last_sample_metrics"):
+            self._volume_rar_cache = None
+            return
+
+        metrics = self.elasticity.last_sample_metrics() or {}
+        psi = metrics.get("psi")
+        idx = metrics.get("idx")
+        total_cells = int(getattr(self.elasticity, "n_cells", 0) or 0)
+        if psi is None or idx is None or total_cells <= 0:
+            self._volume_rar_cache = None
+            return
+
+        psi = np.asarray(psi, dtype=np.float64).reshape(-1)
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        if psi.size == 0 or idx.size == 0 or psi.shape[0] != idx.shape[0]:
+            self._volume_rar_cache = None
+            return
+
+        floor = float(self.cfg.volume_rar_floor)
+        valid = (idx >= 0) & (idx < total_cells) & np.isfinite(psi)
+        if not np.any(valid):
+            self._volume_rar_cache = None
+            return
+
+        sum_abs = np.zeros((total_cells,), dtype=np.float64)
+        counts = np.zeros((total_cells,), dtype=np.float64)
+        np.add.at(sum_abs, idx[valid], np.abs(psi[valid]).astype(np.float64))
+        np.add.at(counts, idx[valid], 1.0)
+
+        avg_abs = np.divide(sum_abs, np.maximum(counts, 1.0))
+        imp = (avg_abs + floor).astype(np.float32)
+        imp = np.where(np.isfinite(imp), imp, floor)
+
+        # EMA 平滑，减少单步噪声
+        decay = float(np.clip(getattr(self.cfg, "volume_rar_ema_decay", 0.0), 0.0, 0.999))
+        prev = None
+        if self._volume_rar_cache is not None:
+            prev = self._volume_rar_cache.get("importance")
+        if prev is not None and isinstance(prev, np.ndarray) and prev.shape == imp.shape and decay > 0:
+            imp = (decay * prev.astype(np.float32) + (1.0 - decay) * imp).astype(np.float32)
+
+        self._volume_rar_cache = {"importance": imp}
+
+    def _maybe_apply_volume_rar(self, step_index: int) -> Tuple[Optional[np.ndarray], str]:
+        """返回一组 DFEM 子单元索引，按应变能密度进行重采样。"""
+
+        if (
+            not self.cfg.volume_rar_enabled
+            or self._volume_rar_cache is None
+            or self.elasticity is None
+        ):
+            return None, ""
+
+        total_cells = int(getattr(self.elasticity, "n_cells", 0) or 0)
+        target_n = getattr(getattr(self.elasticity, "cfg", None), "n_points_per_step", None)
+        if total_cells <= 0 or target_n is None or target_n <= 0:
+            return None, ""
+
+        m = min(int(target_n), total_cells)
+        importance = self._volume_rar_cache.get("importance")
+        if importance is None or importance.shape[0] != total_cells:
+            return None, ""
+
+        rar_frac = float(np.clip(self.cfg.volume_rar_fraction, 0.0, 1.0))
+        min_uniform = int(np.round(m * np.clip(self.cfg.volume_rar_uniform_ratio, 0.0, 1.0)))
+        n_rar = int(np.round(m * rar_frac))
+        if n_rar + min_uniform > m:
+            n_rar = max(0, m - min_uniform)
+        n_uniform = max(0, m - n_rar)
+        if n_rar <= 0:
+            return None, ""
+
+        temp = max(self.cfg.volume_rar_temperature, 1e-6)
+        weights = np.power(importance + float(self.cfg.volume_rar_floor), 1.0 / temp)
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        if float(weights.sum()) <= 0.0:
+            return None, ""
+
+        rng = np.random.default_rng(self.cfg.seed + step_index * 23)
+        probs = weights / (weights.sum() + 1e-12)
+        try:
+            rar_indices = np.array(
+                rng.choice(total_cells, size=n_rar, replace=False, p=probs),
+                dtype=np.int64,
+            )
+        except ValueError:
+            rar_indices = np.array(
+                rng.choice(total_cells, size=n_rar, replace=True, p=probs),
+                dtype=np.int64,
+            )
+
+        if n_uniform > 0:
+            uni_indices = rng.choice(total_cells, size=n_uniform, replace=False)
+            combined = np.concatenate([rar_indices, uni_indices], axis=0)
+        else:
+            combined = rar_indices
+
+        note = f"volRAR {len(rar_indices)}/{m}"
+        return combined, note
+
+    # 在 Trainer 类里新增/覆盖这个方法
+    def _collect_trainable_variables(self):
+        m = self.model
+
+        # 1) 标准 keras.Model 路径
+        if hasattr(m, "trainable_variables") and m.trainable_variables:
+            return m.trainable_variables
+
+        vars_list = []
+
+        # 2) 常见容器属性（按你工程里常见命名，必要时可在这里增减）
+        common_attrs = [
+            "field", "net", "model", "encoder", "cond_encoder", "cond_enc",
+            "embed", "embedding", "backbone", "trunk", "head",
+            "blocks", "layers"
+        ]
+        for name in common_attrs:
+            sub = getattr(m, name, None)
+            if sub is None:
+                continue
+            if hasattr(sub, "trainable_variables"):
+                vars_list += list(sub.trainable_variables)
+            elif isinstance(sub, (list, tuple)):
+                for layer in sub:
+                    if hasattr(layer, "trainable_variables"):
+                        vars_list += list(layer.trainable_variables)
+
+        # 3) 去重
+        seen, out = set(), []
+        for v in vars_list:
+            if v is None:
+                continue
+            vid = id(v)
+            if vid in seen:
+                continue
+            seen.add(vid)
+            out.append(v)
+
+        # 4) 兜底（可能为空：例如图尚未 build）
+        if not out:
+            try:
+                out = list(tf.compat.v1.trainable_variables())
+            except Exception:
+                out = []
+        if not out:
+            raise RuntimeError(
+                "[trainer] 找不到可训练变量。请确认 DisplacementModel 的 Keras 子模块已构建完毕，"
+                "如仍为空，可在 _collect_trainable_variables.common_attrs 中补充实际属性名。"
+            )
+        return out
+
+    def _compute_total_loss(
+        self,
+        total: TotalEnergy,
+        params: Dict[str, Any],
+        *,
+        adaptive: bool = True,
+    ):
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        Pi_raw, parts, stats = total.energy(
+            self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+        )
+        Pi = Pi_raw
+        if self.loss_state is not None:
+            if adaptive:
+                update_loss_weights(self.loss_state, parts, stats)
+            self._tie_preload_weight_to_internal()
+            Pi = combine_loss(parts, self.loss_state)
+        reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+        loss = Pi + reg
+        return loss, Pi, parts, stats
+
+    def _compute_total_loss_incremental(
+        self,
+        total: TotalEnergy,
+        params: Dict[str, Any],
+        *,
+        locked_deltas: Optional[tf.Tensor] = None,
+        force_then_lock: bool = False,
+        adaptive: bool = True,
+    ):
+        """Compute loss for a single stage with optional lock penalty."""
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        _, parts, stats = total.energy(
+            self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+        )
+
+        # No lock penalty: earlier bolts are free to relax.
+
+        Pi = total._combine_parts(parts)
+        if self.loss_state is not None:
+            if adaptive:
+                update_loss_weights(self.loss_state, parts, stats)
+            self._tie_preload_weight_to_internal()
+            Pi = combine_loss(parts, self.loss_state)
+        reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+        loss = Pi + reg
+        return loss, Pi, parts, stats
+
+    def _tie_preload_weight_to_internal(self) -> None:
+        """
+        Keep the external preload work term on the same scale as the internal energy term.
+
+        In the potential-energy formulation Π = U_int - W_pre, weighting W_pre independently
+        is equivalent to implicitly scaling the applied preload P.  We therefore keep
+        W_pre's weight in a fixed ratio to E_int's weight, and avoid using W_pre as a
+        driver term in adaptive weighting.
+        """
+
+        state = self.loss_state
+        if state is None:
+            return
+        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
+        if loss_mode in {"residual", "residual_only", "res"}:
+            return
+
+        focus_terms = getattr(state, "focus_terms", tuple()) or tuple()
+        if "W_pre" in focus_terms:
+            # User explicitly opted in to adapting W_pre; don't override.
+            return
+
+        if "E_int" not in state.current:
+            return
+
+        try:
+            base_int = float(state.base.get("E_int", 0.0) or 0.0)
+            base_pre = float(state.base.get("W_pre", 0.0) or 0.0)
+            cur_int = float(state.current.get("E_int", base_int) or 0.0)
+        except Exception:
+            return
+
+        if base_pre <= 0.0:
+            # Disabled preload term stays disabled.
+            state.current["W_pre"] = 0.0
+            return
+
+        ratio = 1.0
+        if abs(base_int) > 0.0:
+            ratio = base_pre / base_int
+
+        new_pre = max(0.0, cur_int * ratio)
+        min_w = getattr(state, "min_weight", None)
+        max_w = getattr(state, "max_weight", None)
+        if min_w is not None:
+            new_pre = max(float(min_w), new_pre)
+        if max_w is not None:
+            # Match LossWeightState.from_config(): allow base weights to exceed the
+            # global max bound by treating the base as a per-term ceiling.
+            base_cap = float(state.base.get("W_pre", new_pre) or new_pre)
+            eff_max = max(float(max_w), base_cap)
+            new_pre = min(eff_max, new_pre)
+        state.current["W_pre"] = float(new_pre)
+
+    # ----------------- tf.function compiled cores -----------------
+
+    def _loss_from_parts_and_weights(
+        self, parts: Dict[str, tf.Tensor], weights: tf.Tensor
+    ) -> tf.Tensor:
+        """Combine scalar parts with a fixed weight vector (order follows self._loss_keys)."""
+        loss = tf.constant(0.0, dtype=tf.float32)
+        for idx, key in enumerate(getattr(self, "_loss_keys", [])):
+            if key not in parts:
+                continue
+            val = parts[key]
+            if not isinstance(val, tf.Tensor):
+                continue
+            if val.shape.rank != 0:
+                continue
+            loss = loss + tf.cast(weights[idx], tf.float32) * tf.cast(val, tf.float32)
+        return loss
+
+    def _build_weight_vector(self) -> tf.Tensor:
+        """Build a weight vector aligned with self._loss_keys (sign applied)."""
+        keys = getattr(self, "_loss_keys", [])
+        if not keys:
+            return tf.zeros((0,), dtype=tf.float32)
+
+        # Choose the source weight dict.
+        if self.loss_state is not None:
+            weight_map = self.loss_state.current
+            sign_map = self.loss_state.sign_overrides
+        else:
+            weight_map = getattr(self, "_base_weights", {})
+            sign_map = None
+
+        if sign_map is None:
+            loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
+            if loss_mode in {"residual", "residual_only", "res"}:
+                sign_map = {"W_pre": 1.0}
+            else:
+                sign_map = {"W_pre": -1.0}
+
+        weights = []
+        for key in keys:
+            w = float(weight_map.get(key, 0.0) or 0.0)
+            sign = float(sign_map.get(key, 1.0)) if sign_map is not None else 1.0
+            weights.append(w * sign)
+        return tf.convert_to_tensor(weights, dtype=tf.float32)
+
+    @tf.function(reduce_retracing=True)
+    def _compiled_step(self, params: Dict[str, Any], weights: tf.Tensor):
+        """Compiled forward+backward for the standard (non-incremental) path."""
+        train_vars = self._train_vars
+        opt = self.optimizer
+        total = self._total_ref
+
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        with tf.GradientTape() as tape:
+            _, parts, stats = total.energy(
+                self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+            )
+            loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
+            reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+            loss_total = loss_no_reg + reg
+
+            use_loss_scale = hasattr(opt, "get_scaled_loss")
+            if use_loss_scale:
+                scaled_loss = opt.get_scaled_loss(loss_total)
+
+        if use_loss_scale:
+            scaled_grads = tape.gradient(scaled_loss, train_vars)
+            grads = opt.get_unscaled_gradients(scaled_grads)
+        else:
+            grads = tape.gradient(loss_total, train_vars)
+
+        return loss_total, loss_no_reg, parts, stats, grads
+
+    @tf.function(reduce_retracing=True)
+    def _compiled_stage_step(
+        self,
+        params: Dict[str, Any],
+        weights: tf.Tensor,
+    ):
+        """Compiled forward+backward for one incremental stage."""
+        train_vars = self._train_vars
+        opt = self.optimizer
+        total = self._total_ref
+
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        with tf.GradientTape() as tape:
+            _, parts, stats = total.energy(
+                self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+            )
+            # No lock penalty: earlier bolts are free to relax.
+
+            loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
+            reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+            loss_total = loss_no_reg + reg
+
+            use_loss_scale = hasattr(opt, "get_scaled_loss")
+            if use_loss_scale:
+                scaled_loss = opt.get_scaled_loss(loss_total)
+
+        if use_loss_scale:
+            scaled_grads = tape.gradient(scaled_loss, train_vars)
+            grads = opt.get_unscaled_gradients(scaled_grads)
+        else:
+            grads = tape.gradient(loss_total, train_vars)
+
+        return loss_total, loss_no_reg, parts, stats, grads
+
+    def _train_step(
+        self,
+        total,
+        preload_case: Dict[str, np.ndarray],
+        *,
+        step: Optional[int] = None,
+    ):
+        if bool(getattr(self.cfg, "incremental_mode", False)):
+            return self._train_step_incremental(total, preload_case, step=step)
+        opt = self.optimizer
+        train_vars = self._train_vars or self._collect_trainable_variables()
+        if self._total_ref is None:
+            self._total_ref = total
+
+        # 1. 生成完整参数 (包含 stages 字典)
+        params = self._make_preload_params(preload_case)
+        if step is not None:
+            progress = min(1.0, max(0.0, float(step) / float(max(1, self.cfg.max_steps))))
+            params["train_progress"] = tf.constant(progress, dtype=tf.float32)
+
+        weight_vec = self._build_weight_vector()
+        loss, loss_no_reg, parts, stats, grads = self._compiled_step(params, weight_vec)
+
+        if self.loss_state is not None:
+            update_loss_weights(self.loss_state, parts, stats)
+            self._tie_preload_weight_to_internal()
+            Pi = combine_loss(parts, self.loss_state)
+        else:
+            Pi = loss_no_reg
+
+        # 4) 反传 & 梯度裁剪
+        step_txt = "" if step is None else f" step={step}"
+        loss_val = float(tf.cast(loss, tf.float32).numpy())
+        loss_finite = bool(np.isfinite(loss_val))
+
+        if not any(g is not None for g in grads):
+            raise RuntimeError(
+                "[trainer] 所有梯度均为 None，训练无法继续。请确认损失在 tape 作用域内构建，且未用 .numpy()/np.* 切断图。"
+            )
+
+        # 5) 计算/裁剪梯度范数
+        non_none = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
+        g_list, v_list = zip(*non_none)
+        grad_norm = self._safe_global_norm(g_list)
+        grad_norm_val = float(grad_norm.numpy())
+        grad_norm_finite = bool(np.isfinite(grad_norm_val))
+
+        clip_norm = (
+            getattr(self, "clip_grad_norm", None)
+            or getattr(self, "grad_clip_norm", None)
+            or getattr(self.cfg, "clip_grad_norm", None)
+            or getattr(self.cfg, "grad_clip_norm", None)
+        )
+        if clip_norm is not None and float(clip_norm) > 0.0 and grad_norm_finite:
+            g_list = self._safe_clip_by_global_norm(g_list, clip_norm, grad_norm)
+
+        # 不因 NaN/Inf 直接中止训练：跳过本次权重更新，避免 NaN 梯度污染网络权重。
+        if (not loss_finite) or (not grad_norm_finite):
+            return Pi, parts, stats, grad_norm
+
+        apply_kwargs = {}
+        try:
+            sig = inspect.signature(opt.apply_gradients)
+            if "experimental_aggregate_gradients" in sig.parameters:
+                apply_kwargs["experimental_aggregate_gradients"] = False
+        except (TypeError, ValueError):
+            # 如果优化器未公开签名或 apply_gradients 被包装，则回退默认行为
+            apply_kwargs = {}
+
+        opt.apply_gradients(zip(g_list, v_list), **apply_kwargs)
+
+        # 返回“当前权重下”的 Π，而不是 Pi_raw
+        return Pi, parts, stats, grad_norm
+
+    def _train_step_incremental(
+        self,
+        total,
+        preload_case: Dict[str, np.ndarray],
+        *,
+        step: Optional[int] = None,
+    ):
+        """Incremental Mode A: solve stages sequentially with per-stage updates."""
+        opt = self.optimizer
+        train_vars = self._train_vars or self._collect_trainable_variables()
+        if self._total_ref is None:
+            self._total_ref = total
+
+        params_full = self._make_preload_params(preload_case)
+        if step is not None:
+            progress = min(1.0, max(0.0, float(step) / float(max(1, self.cfg.max_steps))))
+            params_full["train_progress"] = tf.constant(progress, dtype=tf.float32)
+        stage_count = self._get_stage_count(params_full)
+        active_count = self._active_stage_count(step, stage_count)
+
+        stage_mode = str(getattr(self.cfg.total_cfg, "preload_stage_mode", "") or "")
+        stage_mode = stage_mode.strip().lower().replace("-", "_")
+        force_then_lock = stage_mode == "force_then_lock"
+
+        if self.contact is not None and self.cfg.reset_contact_state_per_case:
+            self.contact.reset_multipliers(reset_reference=True)
+
+        stage_inner_steps = max(1, int(getattr(self.cfg, "stage_inner_steps", 1)))
+        stage_alm_every = max(1, int(getattr(self.cfg, "stage_alm_every", 1)))
+        use_delta_st = bool(getattr(self.contact.friction.cfg, "use_delta_st", False)) if self.contact else False
+
+        Pi = tf.constant(0.0, dtype=tf.float32)
+        parts: Dict[str, tf.Tensor] = {}
+        stats: Dict[str, Any] = {}
+        grad_norm = tf.constant(0.0, dtype=tf.float32)
+
+        for stage_idx in range(active_count):
+            stage_params = self._extract_stage_params(params_full, stage_idx, keep_context=True)
+            if force_then_lock:
+                stage_last = stage_params.get("stage_last")
+                if stage_last is not None and "P" in stage_params:
+                    P_cum = tf.convert_to_tensor(stage_params["P"], dtype=tf.float32)
+                    stage_params = dict(stage_params)
+                    stage_params["P_cumulative"] = P_cum
+                    stage_params["P"] = P_cum * tf.cast(stage_last, P_cum.dtype)
+
+            prev_params = None
+            if self.contact is not None and use_delta_st and stage_idx > 0:
+                prev_params = self._extract_stage_params(
+                    params_full, stage_idx - 1, keep_context=True
+                )
+                if force_then_lock:
+                    prev_last = prev_params.get("stage_last")
+                    if prev_last is not None and "P" in prev_params:
+                        P_cum_prev = tf.convert_to_tensor(prev_params["P"], dtype=tf.float32)
+                        prev_params = dict(prev_params)
+                        prev_params["P_cumulative"] = P_cum_prev
+                        prev_params["P"] = P_cum_prev * tf.cast(prev_last, P_cum_prev.dtype)
+
+            # Stage-wise contact resampling (keep fixed within stage)
+            if self.contact is not None and self.cfg.stage_resample_contact:
+                seed = int((step or 0) * 100 + (stage_idx + 1))
+                self._resample_contact(seed)
+            if prev_params is not None:
+                u_nodes = None
+                if self.elasticity is not None:
+                    u_nodes = self.elasticity._eval_u_on_nodes(self.model.u_fn, prev_params)
+                self.contact.friction.capture_reference(
+                    self.model.u_fn, prev_params, u_nodes=u_nodes
+                )
+
+            for _ in range(stage_inner_steps):
+                weight_vec = self._build_weight_vector()
+                loss, loss_no_reg, parts, stats, grads = self._compiled_stage_step(
+                    stage_params,
+                    weight_vec,
+                )
+
+                if self.loss_state is not None:
+                    update_loss_weights(self.loss_state, parts, stats)
+                    self._tie_preload_weight_to_internal()
+                    Pi = combine_loss(parts, self.loss_state)
+                else:
+                    Pi = loss_no_reg
+
+                if not any(g is not None for g in grads):
+                    raise RuntimeError(
+                        "[trainer] All gradients are None in incremental step."
+                    )
+
+                non_none = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
+                g_list, v_list = zip(*non_none)
+                grad_norm = self._safe_global_norm(g_list)
+                grad_norm_val = float(grad_norm.numpy())
+                grad_norm_finite = bool(np.isfinite(grad_norm_val))
+
+                clip_norm = (
+                    getattr(self, "clip_grad_norm", None)
+                    or getattr(self, "grad_clip_norm", None)
+                    or getattr(self.cfg, "clip_grad_norm", None)
+                    or getattr(self.cfg, "grad_clip_norm", None)
+                )
+                if clip_norm is not None and float(clip_norm) > 0.0 and grad_norm_finite:
+                    g_list = self._safe_clip_by_global_norm(g_list, clip_norm, grad_norm)
+
+                loss_val = float(tf.cast(loss, tf.float32).numpy())
+                if not (np.isfinite(loss_val) and grad_norm_finite):
+                    continue
+
+                apply_kwargs = {}
+                try:
+                    sig = inspect.signature(opt.apply_gradients)
+                    if "experimental_aggregate_gradients" in sig.parameters:
+                        apply_kwargs["experimental_aggregate_gradients"] = False
+                except (TypeError, ValueError):
+                    apply_kwargs = {}
+
+                opt.apply_gradients(zip(g_list, v_list), **apply_kwargs)
+
+            # Stage ALM update (once per stage by default)
+            if stage_alm_every > 0 and ((stage_idx + 1) % stage_alm_every == 0):
+                total.update_multipliers(self.model.u_fn, params=stage_params)
+
+            # Commit friction reference for delta slip between stages
+            if use_delta_st and self.contact is not None:
+                self.contact.friction.commit_reference()
+
+        return Pi, parts, stats, grad_norm
+
+    def _flatten_tensor_list(
+        self, tensors: Sequence[Optional[tf.Tensor]], sizes: Sequence[int]
+    ) -> tf.Tensor:
+        flats: List[tf.Tensor] = []
+        for tensor, size in zip(tensors, sizes):
+            if tensor is None:
+                flats.append(tf.zeros((size,), dtype=tf.float32))
+            else:
+                flats.append(tf.reshape(tf.cast(tensor, tf.float32), (-1,)))
+        if not flats:
+            return tf.zeros((0,), dtype=tf.float32)
+        return tf.concat(flats, axis=0)
+
+    def _safe_global_norm(self, grads: Sequence[tf.Tensor]) -> tf.Tensor:
+        """Compute global norm without densifying IndexedSlices."""
+
+        def _squared_norm(g: tf.Tensor) -> tf.Tensor:
+            if isinstance(g, tf.IndexedSlices):
+                values = tf.cast(g.values, tf.float32)
+                return tf.reduce_sum(tf.square(values))
+            values = tf.cast(g, tf.float32)
+            return tf.reduce_sum(tf.square(values))
+
+        squared = [_squared_norm(g) for g in grads]
+        if not squared:
+            return tf.constant(0.0, dtype=tf.float32)
+        return tf.sqrt(tf.add_n(squared))
+
+    def _safe_clip_by_global_norm(
+        self, grads: Sequence[tf.Tensor], clip_norm: float, global_norm: tf.Tensor
+    ) -> List[tf.Tensor]:
+        """
+        Clip gradients using a precomputed global norm while keeping IndexedSlices sparse.
+
+        The default `tf.clip_by_global_norm` densifies IndexedSlices, triggering warnings
+        and potential memory spikes. Here we rescale the gradient values directly.
+        """
+
+        clip_norm = tf.cast(clip_norm, tf.float32)
+        global_norm = tf.cast(global_norm, tf.float32)
+        # Avoid division by zero
+        safe_norm = tf.maximum(global_norm, tf.constant(1e-12, dtype=tf.float32))
+        scale = tf.minimum(1.0, clip_norm / safe_norm)
+
+        clipped: List[tf.Tensor] = []
+        for g in grads:
+            if isinstance(g, tf.IndexedSlices):
+                clipped.append(
+                    tf.IndexedSlices(g.values * scale, g.indices, g.dense_shape)
+                )
+            else:
+                clipped.append(g * scale)
+        return clipped
+
+    def _assign_from_flat(
+        self, flat_tensor: tf.Tensor, variables: Sequence[tf.Variable], sizes: Sequence[int]
+    ):
+        offset = 0
+        for var, size in zip(variables, sizes):
+            next_offset = offset + size
+            slice_tensor = tf.reshape(flat_tensor[offset:next_offset], var.shape)
+            var.assign(tf.cast(slice_tensor, var.dtype))
+            offset = next_offset
+
+    def _run_lbfgs_stage(self, total: TotalEnergy, show_progress: bool = False):
+        if not self.cfg.lbfgs_enabled:
+            return
+
+        try:
+            import tensorflow_probability as tfp
+        except ImportError as exc:
+            raise RuntimeError(
+                "启用了 L-BFGS 精调，但当前环境未安装 tensorflow_probability。"
+                "请先安装 tensorflow_probability 再重新运行。"
+            ) from exc
+
+        pbar = None
+        if show_progress:
+            lbfgs_kwargs = dict(
+                total=max(1, int(self.cfg.lbfgs_max_iter)),
+                desc="L-BFGS阶段 (2/2)",
+                leave=True,
+            )
+            if self.cfg.train_bar_color:
+                lbfgs_kwargs["colour"] = self.cfg.train_bar_color
+            pbar = tqdm(**lbfgs_kwargs)
+
+        train_vars = self._collect_trainable_variables()
+        if not train_vars:
+            raise RuntimeError("[lbfgs] 找不到可训练变量，无法执行 L-BFGS 精调。")
+
+        sizes = []
+        for var in train_vars:
+            size = var.shape.num_elements()
+            if size is None:
+                raise ValueError(
+                    f"[lbfgs] 变量 {var.name} 的形状包含未知维度，无法展开为一维向量。"
+                )
+            sizes.append(int(size))
+
+        if self.cfg.lbfgs_reuse_last_batch and self._last_preload_case is not None:
+            lbfgs_case = copy.deepcopy(self._last_preload_case)
+        else:
+            lbfgs_case = self._sample_preload_case()
+
+        lbfgs_params = self._make_preload_params(lbfgs_case)
+        order = lbfgs_case.get("order")
+        if order is None:
+            order_txt = "默认顺序"
+        else:
+            order_txt = "-".join(str(int(i) + 1) for i in order)
+
+        print("[lbfgs] 开始 L-BFGS 精调阶段：")
+        print(
+            f"[lbfgs] 固定预紧力 P={[int(p) for p in lbfgs_case['P']]} N, 顺序={order_txt},"
+            f" 最大迭代 {self.cfg.lbfgs_max_iter}, tol={self.cfg.lbfgs_tolerance}"
+        )
+
+        initial_position = self._flatten_tensor_list(train_vars, sizes)
+
+        def _value_and_gradients(position):
+            self._assign_from_flat(position, train_vars, sizes)
+            with tf.GradientTape() as tape:
+                tape.watch(train_vars)
+                loss, Pi, parts, stats = self._compute_total_loss(
+                    total, lbfgs_params, adaptive=False
+                )
+            grads = tape.gradient(loss, train_vars)
+            grad_vec = self._flatten_tensor_list(grads, sizes)
+            return loss, grad_vec
+
+        results = tfp.optimizer.lbfgs_minimize(
+            value_and_gradients_function=_value_and_gradients,
+            initial_position=initial_position,
+            tolerance=self.cfg.lbfgs_tolerance,
+            max_iterations=self.cfg.lbfgs_max_iter,
+            num_correction_pairs=self.cfg.lbfgs_history_size,
+            parallel_iterations=1,
+            linesearch_max_iterations=max(1, int(self.cfg.lbfgs_line_search)),
+        )
+
+        self._assign_from_flat(results.position, train_vars, sizes)
+
+        status = "converged" if results.converged else "stopped"
+        if results.failed:
+            status = "failed"
+        grad_norm = float(results.gradient_norm.numpy()) if results.gradient_norm is not None else float("nan")
+
+        if pbar is not None:
+            try:
+                completed = int(results.num_iterations.numpy())
+            except Exception:
+                completed = 0
+            pbar.update(max(0, min(self.cfg.lbfgs_max_iter, completed)))
+            pbar.set_postfix_str(
+                self._wrap_bar_text(
+                    f"loss={float(results.objective_value.numpy()):.3e} grad={grad_norm:.3e}"
+                )
+            )
+            pbar.close()
+
+        print(
+            f"[lbfgs] 完成：状态={status}, iters={int(results.num_iterations.numpy())}, "
+            f"loss={float(results.objective_value.numpy()):.3e}, grad={grad_norm:.3e}"
+        )
+
+
+    # ----------------- 训练 -----------------
+    def run(self):
+        self.build()
+        print(f"[trainer] 当前训练设备：{self.device_summary}")
+        total = self._assemble_total()
+        attach_ties_and_bcs_from_inp(
+            total=total,
+            asm=self.asm,
+            cfg=self.cfg,
+        )
+        print("[dbg] Tie/BC 已挂载到 total")
+        self._total_ref = total
+
+        # ---- 初始化自适应损失权重状态 ----
+        # 以 TotalConfig 里的 w_int / w_cn / ... 作为基准权重
+        base_weights = {
+            "E_int": self.cfg.total_cfg.w_int,
+            "E_cn": self.cfg.total_cfg.w_cn,
+            "E_ct": self.cfg.total_cfg.w_ct,
+            "E_fb": getattr(self.cfg.total_cfg, "w_fb", 0.0),
+            "E_region": getattr(self.cfg.total_cfg, "w_region", 0.0),
+            "E_tie": self.cfg.total_cfg.w_tie,
+            "E_bc": self.cfg.total_cfg.w_bc,
+            "W_pre": self.cfg.total_cfg.w_pre,
+            "E_tight": self.cfg.total_cfg.w_tight,
+            "E_sigma": self.cfg.total_cfg.w_sigma,
+            "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
+            "E_reg": getattr(self.cfg.total_cfg, "w_reg", 0.0),
+            "path_penalty_total": getattr(self.cfg.total_cfg, "path_penalty_weight", 0.0),
+            "fric_path_penalty_total": getattr(self.cfg.total_cfg, "fric_path_penalty_weight", 0.0),
+            # 残差项默认权重为 0，需要的话再在 config 里改
+            "R_fric_comp": 0.0,
+            "R_contact_comp": 0.0,
+        }
+        self._base_weights = base_weights
+        self._loss_keys = list(base_weights.keys())
+
+        adaptive_enabled = bool(getattr(self.cfg, "loss_adaptive_enabled", False))
+        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
+        if loss_mode in {"residual", "residual_only", "res"}:
+            sign_overrides = {"W_pre": 1.0}
+        else:
+            sign_overrides = {"W_pre": -1.0}
+        if adaptive_enabled:
+            scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "contact_only")
+            focus_terms = getattr(self.cfg, "loss_focus_terms", tuple())
+            self.loss_state = LossWeightState.from_config(
+                base_weights=base_weights,
+                adaptive_scheme=scheme,
+                ema_decay=getattr(self.cfg, "loss_ema_decay", 0.95),
+                min_factor=getattr(self.cfg, "loss_min_factor", 0.25),
+                max_factor=getattr(self.cfg, "loss_max_factor", 4.0),
+                min_weight=getattr(self.cfg, "loss_min_weight", None),
+                max_weight=getattr(self.cfg, "loss_max_weight", None),
+                gamma=getattr(self.cfg, "loss_gamma", 2.0),
+                focus_terms=focus_terms,
+                update_every=getattr(self.cfg, "loss_update_every", 1),
+                sign_overrides=sign_overrides,
+            )
+        else:
+            self.loss_state = None
+        if self.cfg.lbfgs_enabled:
+            train_desc = "Adam阶段 (1/2)"
+        else:
+            train_desc = "训练"
+        self._run_start_time = time.perf_counter()
+        self._time_to_target_step = None
+        self._time_to_target_seconds = None
+        train_pb_kwargs = dict(total=self.cfg.max_steps, desc=train_desc, leave=True)
+        if self.cfg.train_bar_color:
+            train_pb_kwargs["colour"] = self.cfg.train_bar_color
+        with tqdm(**train_pb_kwargs) as p_train:
+            for step in range(1, self.cfg.max_steps + 1):
+                mf_note = self._maybe_update_multifidelity_schedule(step)
+                # 子进度条：本 step 的 4 个动作
+                step_pb_kwargs = dict(total=4, leave=False)
+                if self.cfg.step_bar_color:
+                    step_pb_kwargs["colour"] = self.cfg.step_bar_color
+                with tqdm(**step_pb_kwargs) as p_step:
+                    # 1) 接触重采样
+                    self._set_pbar_desc(
+                        p_step,
+                        f"step {step}: 接触重采样" + (f" [{mf_note}]" if mf_note else ""),
+                    )
+                    t0 = time.perf_counter()
+                    contact_note = "跳过"
+                    if self.contact is None:
+                        contact_note = "跳过 (无接触体)"
+                        self._contact_rar_cache = None
+                    else:
+                        if self.cfg.incremental_mode and self.cfg.stage_resample_contact:
+                            contact_note = "阶段内重采样"
+                        else:
+                            should_resample = step == 1
+                            if not should_resample and self.cfg.resample_contact_every > 0:
+                                should_resample = (
+                                    (step - 1) % self.cfg.resample_contact_every == 0
+                                )
+
+                            if should_resample:
+                                contact_note = self._resample_contact(step)
+                            else:
+                                if self.cfg.resample_contact_every <= 0:
+                                    contact_note = "跳过 (沿用首步采样)"
+                                else:
+                                    remaining = self.cfg.resample_contact_every - (
+                                        (step - 1) % self.cfg.resample_contact_every
+                                    )
+                                    contact_note = f"跳过 (距下次还有 {remaining} 步)"
+                    elapsed = time.perf_counter() - t0
+                    self._step_stage_times.append(("resample", elapsed))
+                    self._set_pbar_postfix(
+                        p_step,
+                        f"{contact_note} | {self._format_seconds(elapsed)}"
+                    )
+                    p_step.update(1)
+
+                    # 2) 前向 + 反传（随机采样三螺栓预紧力）
+                    self._set_pbar_desc(p_step, f"step {step}: 前向/反传")
+                    t0 = time.perf_counter()
+                    preload_case = self._sample_preload_case()
+                    # 动态提升接触惩罚/ALM 参数（软→硬）
+                    self._maybe_update_contact_hardening(step)
+                    self._maybe_update_friction_smoothing(step)
+                    vol_note = ""
+                    if self.elasticity is not None and hasattr(self.elasticity, "set_sample_indices"):
+                        vol_indices, vol_note = self._maybe_apply_volume_rar(step)
+                        self.elasticity.set_sample_indices(vol_indices)
+                    Pi, parts, stats, grad_norm = self._train_step(total, preload_case, step=step)
+                    P_np = preload_case["P"]
+                    order_np = preload_case.get("order")
+                    self._last_preload_case = copy.deepcopy(preload_case)
+                    self._update_contact_rar_cache()
+                    self._update_volume_rar_cache()
+                    if self._time_to_target_step is None and self._run_start_time is not None:
+                        pen_now = self._stat_float(
+                            stats,
+                            "cn_pen_ratio",
+                            "n_pen_ratio",
+                            "pen_ratio",
+                        )
+                        target_pen = float(getattr(self.cfg, "speed_target_pen_ratio", 0.20))
+                        if pen_now is not None and pen_now <= target_pen:
+                            elapsed_tta = max(0.0, time.perf_counter() - self._run_start_time)
+                            self._time_to_target_step = int(step)
+                            self._time_to_target_seconds = float(elapsed_tta)
+                            print(
+                                "[speed] 达到接触精度阈值："
+                                f"pen_ratio={pen_now:.3f} <= {target_pen:.3f}, "
+                                f"step={step}, elapsed={elapsed_tta:.2f}s"
+                            )
+                    pi_val = float(Pi.numpy())
+                    if self._pi_baseline is None:
+                        self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
+                    if self._pi_ema is None:
+                        self._pi_ema = pi_val
+                    else:
+                        ema_alpha = 0.1
+                        self._pi_ema = (1 - ema_alpha) * self._pi_ema + ema_alpha * pi_val
+                    rel_pi = pi_val / (self._pi_baseline or pi_val or 1.0)
+                    rel_delta = None
+                    if self._prev_pi is not None and self._prev_pi != 0.0:
+                        rel_delta = (self._prev_pi - pi_val) / abs(self._prev_pi)
+                    self._prev_pi = pi_val
+                    elapsed = time.perf_counter() - t0
+                    self._step_stage_times.append(("train", elapsed))
+                    device = self._short_device_name(getattr(Pi, "device", None))
+                    grad_val = float(grad_norm.numpy()) if hasattr(grad_norm, "numpy") else float(grad_norm)
+                    rel_pct = rel_pi * 100.0 if rel_pi is not None else None
+                    rel_txt = (
+                        f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
+                    )
+                    d_txt = (
+                        f"ΔΠ={rel_delta * 100:+.1f}%"
+                        if rel_delta is not None
+                        else "ΔΠ=--"
+                    )
+                    ema_txt = f"Πema={self._pi_ema:.2e}" if self._pi_ema is not None else "Πema=--"
+                    order_txt = ""
+                    if order_np is not None:
+                        order_txt = " order=" + "-".join(str(int(x) + 1) for x in order_np)
+                    energy_summary = self._format_energy_summary(parts)
+                    energy_txt = f" | {energy_summary}" if energy_summary else ""
+                    if vol_note:
+                        energy_txt += f" | {vol_note}"
+                    train_note = (
+                        f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}]"
+                        f"{order_txt}{energy_txt} | Π={pi_val:.2e} {rel_txt} {d_txt} "
+                        f"grad={grad_val:.2e} {ema_txt}"
+                    )
+                    if self._time_to_target_step is not None and self._time_to_target_seconds is not None:
+                        train_note += (
+                            f" | TTA={self._time_to_target_seconds:.1f}s@{self._time_to_target_step}"
+                        )
+                    if step == 1:
+                        train_note += " | 首轮包含图追踪/缓存构建"
+                    self._set_pbar_postfix(
+                        p_step,
+                        f"{train_note} | {self._format_seconds(elapsed)} | dev={device}"
+                    )
+                    p_step.update(1)
+
+                    # 3) ALM 更新
+                    self._set_pbar_desc(p_step, f"step {step}: ALM 更新")
+                    t0 = time.perf_counter()
+                    alm_note = "跳过"
+                    if self.contact is None:
+                        alm_note = "跳过 (无接触体)"
+                    elif self.cfg.incremental_mode:
+                        alm_note = "跳过 (incremental)"
+                    elif self.cfg.alm_update_every <= 0:
+                        alm_note = "跳过 (已禁用)"
+                    elif step % self.cfg.alm_update_every == 0:
+                        params_for_update = self._make_preload_params(preload_case)
+                        total.update_multipliers(self.model.u_fn, params=params_for_update)
+                        alm_note = "已更新"
+                    else:
+                        remaining = self.cfg.alm_update_every - (
+                            step % self.cfg.alm_update_every
+                        )
+                        alm_note = f"跳过 (距下次还有 {remaining} 步)"
+                    elapsed = time.perf_counter() - t0
+                    self._step_stage_times.append(("alm", elapsed))
+                    self._set_pbar_postfix(
+                        p_step,
+                        f"{alm_note} | {self._format_seconds(elapsed)}"
+                    )
+                    p_step.update(1)
+
+                    # 4) 日志/检查点
+                    self._set_pbar_desc(p_step, f"step {step}: 日志/检查点")
+                    t0 = time.perf_counter()
+                    log_note = "跳过"
+                    if self.cfg.log_every <= 0:
+                        log_note = "跳过 (已禁用)"
+                    else:
+                        should_log = step == 1 or step % self.cfg.log_every == 0
+                        if should_log:
+                            postfix, log_note = self._format_train_log_postfix(
+                                P_np,
+                                Pi,
+                                parts,
+                                stats,
+                                grad_val,
+                                rel_pi,
+                                rel_delta,
+                                order_np,
+                            )
+                            if postfix:
+                                p_train.set_postfix_str(postfix)
+                                # 额外打印到终端（确保不被进度条覆盖）
+                                print(f"\n[Step {step}] {postfix}", flush=True)
+
+                            metric_name = self.cfg.save_best_on.lower()
+                            metric_val = (
+                                pi_val
+                                if metric_name == "pi"
+                                else float(parts["E_int"].numpy())
+                            )
+                            if metric_val < self.best_metric:
+                                ckpt_path = self._save_checkpoint_best_effort(step)
+                                if ckpt_path:
+                                    self.best_metric = metric_val
+                                    log_note += f" | 已保存 {os.path.basename(ckpt_path)}"
+                                else:
+                                    log_note += " | checkpoint 保存失败(已跳过)"
+
+                    if (
+                        self.cfg.log_every > 0
+                        and not (step == 1 or step % self.cfg.log_every == 0)
+                    ):
+                        remaining = self.cfg.log_every - (step % self.cfg.log_every)
+                        log_note = f"跳过 (距下次还有 {remaining} 步)"
+                    elapsed = time.perf_counter() - t0
+                    self._step_stage_times.append(("log", elapsed))
+                    self._set_pbar_postfix(
+                        p_step,
+                        f"{log_note} | {self._format_seconds(elapsed)}"
+                    )
+                    p_step.update(1)
+
+                p_train.update(1)
+
+                if step % max(1, self.cfg.log_every) == 0:
+                    total_spent = sum(t for _, t in self._step_stage_times)
+                    if total_spent > 0:
+                        label_map = {
+                            "resample": "采样",
+                            "train": "前向/反传",
+                            "alm": "ALM",
+                            "log": "日志"
+                        }
+                        parts_txt = ", ".join(
+                            f"{label_map.get(name, name)}:{t / total_spent * 100:.0f}%"
+                            for name, t in self._step_stage_times
+                        )
+                        summary_note = (
+                            f"step{step}耗时 {self._format_seconds(total_spent)} ({parts_txt})"
+                        )
+                        if step == 1:
+                            summary_note += " | 首轮额外包括图追踪/初次缓存"
+                        self._set_pbar_postfix(p_train, summary_note)
+                    self._step_stage_times.clear()
+
+        if self._time_to_target_step is not None and self._time_to_target_seconds is not None:
+            print(
+                "[speed] Time-to-accuracy (pen_ratio threshold) = "
+                f"{self._time_to_target_seconds:.2f}s at step {self._time_to_target_step}"
+            )
+        else:
+            print(
+                "[speed] 未在本轮训练内达到 pen_ratio 阈值 "
+                f"{float(getattr(self.cfg, 'speed_target_pen_ratio', 0.20)):.3f}"
+            )
+
+        # 训练结束：再存一次
+        if self.ckpt_manager is not None:
+            final_ckpt = self._save_checkpoint_best_effort(self.cfg.max_steps)
+            if final_ckpt:
+                print(f"[trainer] 训练结束已保存 checkpoint -> {final_ckpt}")
+            else:
+                print("[trainer] WARNING: 训练结束 checkpoint 保存失败(已跳过)")
+
+        if self.cfg.lbfgs_enabled:
+            self._run_lbfgs_stage(total, show_progress=True)
+
+        self._visualize_after_training(n_samples=self.cfg.viz_samples_after_train)
+
+    def export_saved_model(self, export_dir: str) -> str:
+        """Export the PINN displacement model as a TensorFlow SavedModel."""
+
+        if self.model is None:
+            raise RuntimeError("Trainer.export_saved_model() requires build()/restore().")
+
+        n_bolts = max(1, len(self.cfg.preload_specs) or 3)
+        stage_mode = str(getattr(self.cfg.total_cfg, "preload_stage_mode", "") or "")
+        stage_mode = stage_mode.strip().lower().replace("-", "_")
+        append_release_stage = bool(
+            self.cfg.preload_use_stages and stage_mode == "force_then_lock"
+        )
+
+        module = _SavedModelModule(
+            model=self.model,
+            use_stages=bool(self.cfg.preload_use_stages),
+            append_release_stage=append_release_stage,
+            shift=float(self.cfg.model_cfg.preload_shift),
+            scale=float(self.cfg.model_cfg.preload_scale),
+            n_bolts=n_bolts,
+        )
+        serving_fn = module.run.get_concrete_function()
+        tf.saved_model.save(module, export_dir, signatures={"serving_default": serving_fn})
+        print(f"[trainer] SavedModel exported -> {export_dir}")
+        return export_dir
+
+    # ----------------- 可视化（鲁棒多签名） -----------------
+    def _call_viz(self, P: np.ndarray, params: Dict[str, tf.Tensor], out_path: str, title: str):
+        bare = self.cfg.mirror_surface_name
+        data_path = None
+        if self.cfg.viz_write_data and out_path:
+            data_path = os.path.splitext(out_path)[0] + ".txt"
+
+        mesh_path = None
+        if self.cfg.viz_write_surface_mesh and out_path:
+            mesh_path = "auto"
+
+        full_plot_enabled = bool(self.cfg.viz_plot_full_structure)
+        full_struct_out = "auto" if (full_plot_enabled and out_path) else None
+        full_struct_data = (
+            "auto" if (full_plot_enabled and self.cfg.viz_write_full_structure_data and out_path) else None
+        )
+
+        diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
+
+        result = plot_mirror_deflection_by_name(
+            self.asm,
+            bare,
+            self.model.u_fn,
+            params,
+            P_values=tuple(float(x) for x in P.reshape(-1)),
+            out_path=out_path,
+            render_surface=self.cfg.viz_surface_enabled,
+            surface_source=self.cfg.viz_surface_source,
+            title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
+            data_out_path=data_path,
+            surface_mesh_out_path=mesh_path,
+            plot_full_structure=full_plot_enabled,
+            full_structure_out_path=full_struct_out,
+            full_structure_data_out_path=full_struct_data,
+            full_structure_part=self.cfg.viz_full_structure_part,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
+            refine_subdivisions=self.cfg.viz_refine_subdivisions,
+            refine_max_points=self.cfg.viz_refine_max_points,
+            use_shape_function_interp=self.cfg.viz_use_shape_function_interp,
+            retriangulate_2d=self.cfg.viz_retriangulate_2d,
+            eval_batch_size=self.cfg.viz_eval_batch_size,
+            eval_scope=self.cfg.viz_eval_scope,
+            diagnose_blanks=self.cfg.viz_diagnose_blanks,
+            auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
+            remove_rigid=self.cfg.viz_remove_rigid,
+            diag_out=diag_out,
+        )
+        return result
+
+    def _fixed_viz_preload_cases(self) -> List[Dict[str, np.ndarray]]:
+        """生成固定拧紧角案例以避免可视化阶段的随机性."""
+
+        nb = int(getattr(self, "_preload_dim", 0) or len(self.cfg.preload_specs) or 1)
+        lo = float(self.cfg.preload_min)
+        hi = float(self.cfg.preload_max)
+        mid = 0.5 * (lo + hi)
+
+        def _make_case(P_list: Sequence[float], order: Sequence[int]) -> Dict[str, np.ndarray]:
+            P_arr = np.asarray(P_list, dtype=np.float32).reshape(-1)
+            if P_arr.size != nb:
+                raise ValueError(f"固定可视化需要 {nb} 维角度输入，收到 {P_arr.size} 维。")
+            case: Dict[str, np.ndarray] = {"P": P_arr}
+            if not self.cfg.preload_use_stages:
+                return case
+            order_norm = self._normalize_order(order, nb)
+            if order_norm is None:
+                return case
+            case["order"] = order_norm
+            case.update(self._build_stage_case(P_arr, order_norm))
+            return case
+
+        cases: List[Dict[str, np.ndarray]] = []
+
+        # 单螺母: 仅一个达到 hi，其余为 lo
+        for i in range(nb):
+            arr = [lo] * nb
+            arr[i] = hi
+            cases.append(_make_case(arr, order=list(range(nb))))
+
+        # 等幅: 全部为 mid，并给出两种顺序（若 nb>=2）
+        cases.append(_make_case([mid] * nb, order=list(range(nb))))
+        if nb >= 2:
+            cases.append(_make_case([mid] * nb, order=list(reversed(range(nb)))))
+
+        return cases
+
+    def _visualize_after_training(self, n_samples: int = 5):
+        if self.asm is None or self.model is None:
+            return
+        os.makedirs(self.cfg.out_dir, exist_ok=True)
+        cases = None
+        if self._last_preload_case is not None:
+            cases = [copy.deepcopy(self._last_preload_case)]
+            print("[viz] Using last training tightening case for visualization.")
+        else:
+            cases = self._fixed_viz_preload_cases()
+        n_total = len(cases) if cases else n_samples
+        print(
+            f"[trainer] Generating {n_total} deflection maps for '{self.cfg.mirror_surface_name}' ..."
+        )
+        iter_cases = cases if cases else [self._sample_preload_case() for _ in range(n_samples)]
+        viz_records: List[Dict[str, Any]] = []
+        for i, preload_case in enumerate(iter_cases):
+            P = preload_case["P"]
+            order_display = None
+            if self.cfg.preload_use_stages and "order" in preload_case:
+                order_display = "-".join(
+                    str(int(o) + 1) for o in preload_case["order"].tolist()
+                )
+            unit = str(getattr(self.cfg.tightening_cfg, "angle_unit", "deg") or "deg")
+            angle_txt = ",".join(f"{float(x):.2f}" for x in P.tolist())
+            title = f"{self.cfg.viz_title_prefix}  theta=[{angle_txt}]{unit}"
+            if order_display:
+                title += f"  (order={order_display})"
+            suffix = f"_{order_display.replace('-', '')}" if order_display else ""
+            save_path = os.path.join(
+                self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}.png"
+            )
+            params_full = self._make_preload_params(preload_case)
+            params_eval = self._extract_final_stage_params(params_full, keep_context=True)
+
+            # Write a compact tightening report next to the figure.
+            if self.tightening is not None and save_path:
+                try:
+                    report_path = os.path.splitext(save_path)[0] + "_tightening.txt"
+                    stage_rows = []
+                    if (
+                        self.cfg.preload_use_stages
+                        and isinstance(preload_case, dict)
+                        and "stages" in preload_case
+                    ):
+                        stages_np = np.asarray(preload_case.get("stages"), dtype=np.float32)
+                        if stages_np.ndim == 2 and stages_np.shape[0] > 0:
+                            for s in range(int(stages_np.shape[0])):
+                                params_s = self._extract_stage_params(params_full, s, keep_context=True)
+                                _, st = self.tightening.energy(self.model.u_fn, params_s)
+                                stage_rows.append(
+                                    np.asarray(st.get("tightening", {}).get("rms", []))
+                                )
+                    _, st_final = self.tightening.energy(self.model.u_fn, params_eval)
+                    final_row = np.asarray(st_final.get("tightening", {}).get("rms", []))
+
+                    with open(report_path, "w", encoding="utf-8") as fp:
+                        fp.write(f"theta = {P.tolist()}  [{unit}]\n")
+                        if self.cfg.preload_use_stages and "order" in preload_case:
+                            fp.write(f"order = {preload_case['order'].tolist()}  (0-based)\n")
+                        fp.write("rms = [r1, r2, ...]\n")
+                        for s, row in enumerate(stage_rows, start=1):
+                            fp.write(f"stage_{s}: {row.tolist()}\n")
+                        fp.write(f"final: {final_row.tolist()}\n")
+                except Exception as exc:
+                    print(f"[viz] tightening report skipped: {exc}")
+            try:
+                _, _, data_path = self._call_viz(P, params_eval, save_path, title)
+                if self.cfg.viz_surface_enabled:
+                    if not os.path.exists(save_path):
+                        try:
+                            import matplotlib.pyplot as plt
+                            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+                            plt.close()
+                        except Exception:
+                            pass
+                    if order_display:
+                        print(f"[viz] saved -> {save_path}  (order={order_display})")
+                    else:
+                        print(f"[viz] saved -> {save_path}")
+                    if data_path:
+                        print(f"[viz] displacement data -> {data_path}")
+                viz_records.append(
+                    {
+                        "index": i + 1,
+                        "P": np.asarray(P, dtype=np.float64).reshape(-1),
+                        "order": None if "order" not in preload_case else preload_case.get("order"),
+                        "order_display": order_display,
+                        "png_path": save_path,
+                        "data_path": data_path,
+                        "mesh_path": (
+                            os.path.splitext(save_path)[0] + "_surface.ply"
+                            if self.cfg.viz_write_surface_mesh and save_path
+                            else None
+                        ),
+                    }
+                )
+            except TypeError as e:
+                print("[viz] signature mismatch:", e)
+            except Exception as e:
+                print("[viz] error:", e)
+
+            # Optional: plot each preload stage to make tightening order visible.
+            if (
+                self.cfg.viz_plot_stages
+                and self.cfg.preload_use_stages
+                and isinstance(preload_case, dict)
+                and "stages" in preload_case
+            ):
+                try:
+                    stages_np = np.asarray(preload_case.get("stages"), dtype=np.float32)
+                    if stages_np.ndim == 2 and stages_np.shape[0] > 1:
+                        for s in range(int(stages_np.shape[0])):
+                            P_stage = stages_np[s]
+                            title_s = f"{self.cfg.viz_title_prefix}  P=[{int(P_stage[0])},{int(P_stage[1])},{int(P_stage[2])}]N"
+                            if order_display:
+                                title_s += f"  (order={order_display})"
+                            title_s += f"  (stage={s+1}/{int(stages_np.shape[0])})"
+                            save_path_s = os.path.join(
+                                self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}_s{s+1}.png"
+                            )
+                            params_s = self._extract_stage_params(params_full, s, keep_context=True)
+                            self._call_viz(P_stage, params_s, save_path_s, title_s)
+                except Exception as exc:
+                    print(f"[viz] stage plots skipped: {exc}")
+
+        # Additional comparison outputs: common-scale maps and delta maps between cases.
+        if cases and viz_records and len(viz_records) > 1 and self.cfg.viz_compare_cases:
+            try:
+                self._write_viz_comparison(viz_records)
+            except Exception as exc:
+                print(f"[viz] comparison skipped: {exc}")
+
+    @staticmethod
+    def _read_viz_samples(path: str) -> Optional[Dict[str, Any]]:
+        if not path or not os.path.exists(path):
+            return None
+
+        node_ids: List[int] = []
+        ux: List[float] = []
+        uy: List[float] = []
+        uz: List[float] = []
+        umag: List[float] = []
+        u_plane: List[float] = []
+        v_plane: List[float] = []
+        rigid_line: Optional[str] = None
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    if "rigid_body_removed" in line:
+                        rigid_line = line
+                    continue
+                cols = line.split()
+                if len(cols) < 10:
+                    continue
+                try:
+                    node_ids.append(int(cols[0]))
+                    ux.append(float(cols[4]))
+                    uy.append(float(cols[5]))
+                    uz.append(float(cols[6]))
+                    umag.append(float(cols[7]))
+                    u_plane.append(float(cols[8]))
+                    v_plane.append(float(cols[9]))
+                except Exception:
+                    continue
+
+        if not node_ids:
+            return None
+
+        node_arr = np.asarray(node_ids, dtype=np.int64)
+        order = np.argsort(node_arr)
+        return {
+            "node_id": node_arr[order],
+            "ux": np.asarray(ux, dtype=np.float64)[order],
+            "uy": np.asarray(uy, dtype=np.float64)[order],
+            "uz": np.asarray(uz, dtype=np.float64)[order],
+            "umag": np.asarray(umag, dtype=np.float64)[order],
+            "u_plane": np.asarray(u_plane, dtype=np.float64)[order],
+            "v_plane": np.asarray(v_plane, dtype=np.float64)[order],
+            "rigid_line": rigid_line,
+        }
+
+    def _write_viz_comparison(self, records: List[Dict[str, Any]]) -> None:
+        """
+        Generate:
+        - common-scale |u| maps to make amplitude comparable
+        - delta maps (vector displacement difference) to highlight subtle differences
+        - a text report with quantitative metrics
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.tri import Triangulation
+        from matplotlib import colors
+
+        def _read_surface_ply_mesh(path: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+            if not path or not os.path.exists(path):
+                return None
+            n_vert = None
+            n_face = None
+            header_done = False
+            node_ids: List[int] = []
+            tris: List[Tuple[int, int, int]] = []
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    if not header_done:
+                        if s.startswith("element vertex"):
+                            parts = s.split()
+                            if len(parts) >= 3:
+                                n_vert = int(parts[2])
+                        elif s.startswith("element face"):
+                            parts = s.split()
+                            if len(parts) >= 3:
+                                n_face = int(parts[2])
+                        elif s == "end_header":
+                            header_done = True
+                            break
+                if not header_done or n_vert is None or n_face is None:
+                    return None
+
+                for _ in range(int(n_vert)):
+                    row = f.readline()
+                    if not row:
+                        return None
+                    cols = row.strip().split()
+                    if len(cols) < 4:
+                        return None
+                    node_ids.append(int(cols[3]))
+
+                for _ in range(int(n_face)):
+                    row = f.readline()
+                    if not row:
+                        break
+                    cols = row.strip().split()
+                    if len(cols) < 4:
+                        continue
+                    try:
+                        n = int(cols[0])
+                    except Exception:
+                        continue
+                    if n < 3:
+                        continue
+                    # Expect triangles; if not, take the first three vertices as a fallback.
+                    i0, i1, i2 = int(cols[1]), int(cols[2]), int(cols[3])
+                    tris.append((i0, i1, i2))
+
+            if not node_ids or not tris:
+                return None
+            return (
+                np.asarray(node_ids, dtype=np.int64),
+                np.asarray(tris, dtype=np.int32),
+            )
+
+        samples: List[Dict[str, Any]] = []
+        for rec in records:
+            data_path = rec.get("data_path")
+            if not data_path:
+                continue
+            s = self._read_viz_samples(str(data_path))
+            if s is None:
+                continue
+            s["record"] = rec
+            samples.append(s)
+
+        if len(samples) < 2:
+            return
+
+        # Use the first sample as the geometric base for triangulation/mapping.
+        geom_base = samples[0]
+        geom_base_rec = geom_base["record"]
+        base_nodes = geom_base["node_id"]
+
+        # Common scale across all cases (for |u| maps)
+        global_umax = 0.0
+        for s in samples:
+            global_umax = max(global_umax, float(np.nanmax(s["umag"])))
+        global_umax = float(global_umax) + 1e-16
+
+        # Triangulation in (u,v) plane for diff plots: prefer FE connectivity from the surface PLY.
+        u = np.asarray(geom_base["u_plane"], dtype=np.float64)
+        v = np.asarray(geom_base["v_plane"], dtype=np.float64)
+        tri = None
+        vertex_pos: Optional[np.ndarray] = None
+        mesh_info = _read_surface_ply_mesh(str(geom_base_rec.get("mesh_path") or ""))
+        if mesh_info is not None:
+            mesh_nodes, mesh_tris = mesh_info
+            pos = np.searchsorted(base_nodes, mesh_nodes)
+            ok = (
+                (pos >= 0)
+                & (pos < base_nodes.shape[0])
+                & (base_nodes[pos] == mesh_nodes)
+            )
+            if np.all(ok):
+                u_vert = u[pos]
+                v_vert = v[pos]
+                tri = Triangulation(u_vert, v_vert, triangles=mesh_tris)
+                vertex_pos = pos
+        if tri is None:
+            tri = Triangulation(u, v)
+            cu, cv = float(np.mean(u)), float(np.mean(v))
+            r = np.sqrt((u - cu) ** 2 + (v - cv) ** 2)
+            r_inner = float(np.nanmin(r)) * 1.02
+            r_outer = float(np.nanmax(r)) * 0.98
+            tris = np.asarray(tri.triangles, dtype=np.int64)
+            uc = u[tris].mean(axis=1)
+            vc = v[tris].mean(axis=1)
+            rc = np.sqrt((uc - cu) ** 2 + (vc - cv) ** 2)
+            tri.set_mask((rc < r_inner) | (rc > r_outer))
+
+        # Report
+        report_path = os.path.join(self.cfg.out_dir, "deflection_compare.txt")
+        with open(report_path, "w", encoding="utf-8") as fp:
+            fp.write("Deflection comparison report (PINN)\n")
+            fp.write(f"triangulation_base = deflection_{geom_base_rec.get('index', 1):02d}\n\n")
+            fp.write("Cases:\n")
+            for s in samples:
+                rec = s["record"]
+                idx = int(rec.get("index", 0))
+                P = rec.get("P")
+                order_disp = rec.get("order_display") or "-"
+                fp.write(
+                    f"- {idx:02d} P={P.tolist() if hasattr(P, 'tolist') else P} order={order_disp}"
+                )
+                if s.get("rigid_line"):
+                    fp.write(f" | {s['rigid_line'].lstrip('#').strip()}")
+                fp.write("\n")
+            fp.write("\nDiffs (grouped by identical P):\n")
+
+            # Common-scale maps (optional)
+            if self.cfg.viz_compare_common_scale:
+                for s in samples:
+                    rec = s["record"]
+                    idx = int(rec.get("index", 0))
+                    out_name = f"deflection_{idx:02d}_common.png"
+                    out_path = os.path.join(self.cfg.out_dir, out_name)
+                    umag_plot = (
+                        s["umag"] if vertex_pos is None else s["umag"][vertex_pos]
+                    )
+                    fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
+                    sc = ax.tripcolor(
+                        tri,
+                        umag_plot,
+                        shading="gouraud",
+                        cmap=str(self.cfg.viz_colormap or "turbo"),
+                        norm=colors.Normalize(vmin=0.0, vmax=global_umax),
+                        edgecolors="none",
+                    )
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.92, pad=0.02)
+                    cbar.set_label(f"Total displacement magnitude [{self.cfg.viz_units}] (common scale)")
+                    ax.set_aspect("equal", adjustable="box")
+                    ax.set_xlabel("u (best-fit plane)")
+                    ax.set_ylabel("v (best-fit plane)")
+                    title = f"{self.cfg.viz_title_prefix} | common scale"
+                    P = rec.get("P")
+                    if P is not None and len(P) >= 3:
+                        title += f"  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
+                    od = rec.get("order_display")
+                    if od:
+                        title += f" (order={od})"
+                    ax.set_title(title)
+                    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+                    plt.close(fig)
+
+            # Delta plots/metrics: compare within each identical-P group so tightening order is directly visible.
+            def _key_from_P(rec: Dict[str, Any]) -> Tuple[int, ...]:
+                P = rec.get("P")
+                if P is None:
+                    return tuple()
+                arr = np.asarray(P, dtype=np.float64).reshape(-1)
+                return tuple(int(round(float(x))) for x in arr.tolist())
+
+            groups: Dict[Tuple[int, ...], List[Dict[str, Any]]] = {}
+            for s in samples:
+                rec = s["record"]
+                key = _key_from_P(rec)
+                groups.setdefault(key, []).append(s)
+
+            for key, group in sorted(groups.items(), key=lambda kv: kv[0]):
+                if len(group) < 2:
+                    continue
+                group = sorted(group, key=lambda s: int(s["record"].get("index", 0)))
+                base = group[0]
+                base_rec = base["record"]
+                base_idx = int(base_rec.get("index", 0))
+                fp.write(f"\nP={list(key)} base={base_idx:02d}:\n")
+
+                for s in group[1:]:
+                    rec = s["record"]
+                    idx = int(rec.get("index", 0))
+                    nodes = s["node_id"]
+                    if nodes.shape != base_nodes.shape or not np.all(nodes == base_nodes):
+                        fp.write(f"- {idx:02d}: node mismatch, skipped\n")
+                        continue
+
+                    dux = s["ux"] - base["ux"]
+                    duy = s["uy"] - base["uy"]
+                    duz = s["uz"] - base["uz"]
+                    du = np.sqrt(dux * dux + duy * duy + duz * duz)
+                    rms = float(np.sqrt(np.mean(du * du)))
+                    maxv = float(np.max(du))
+                    dmag = s["umag"] - base["umag"]
+                    max_abs_dmag = float(np.max(np.abs(dmag)))
+                    arg = int(np.argmax(du))
+                    node_max = int(nodes[arg])
+                    u_max = float(u[arg])
+                    v_max = float(v[arg])
+                    fp.write(
+                        f"- {idx:02d}: rms|du|={rms:.3e} max|du|={maxv:.3e} "
+                        f"max|Δ|u||={max_abs_dmag:.3e} @node={node_max} (u,v)=({u_max:.3f},{v_max:.3f})\n"
+                    )
+
+                    dmag_plot = dmag if vertex_pos is None else dmag[vertex_pos]
+                    vlim = float(np.max(np.abs(dmag_plot))) + 1e-16
+                    out_name = f"deflection_diff_{idx:02d}_minus_{base_idx:02d}.png"
+                    out_path = os.path.join(self.cfg.out_dir, out_name)
+                    fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
+                    norm = colors.TwoSlopeNorm(vmin=-vlim, vcenter=0.0, vmax=vlim)
+                    sc = ax.tripcolor(
+                        tri,
+                        dmag_plot,
+                        shading="gouraud",
+                        cmap=str(self.cfg.viz_compare_cmap or "coolwarm"),
+                        norm=norm,
+                        edgecolors="none",
+                    )
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.92, pad=0.02)
+                    cbar.set_label(f"Δ|u| [{self.cfg.viz_units}]")
+                    ax.set_aspect("equal", adjustable="box")
+                    ax.set_xlabel("u (best-fit plane)")
+                    ax.set_ylabel("v (best-fit plane)")
+                    title = f"Δ|u| vs base ({base_idx:02d})"
+                    P = rec.get("P")
+                    if P is not None and len(P) >= 3:
+                        title += f"  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
+                    od = rec.get("order_display")
+                    if od:
+                        title += f" (order={od})"
+                    ax.set_title(title)
+                    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+                    plt.close(fig)
+
+        print(f"[viz] comparison report -> {report_path}")
+
+
+class _SavedModelModule(tf.Module):
+    """TensorFlow module exposing the PINN forward pass for SavedModel export."""
+
+    @tf.autograph.experimental.do_not_convert
+    def __init__(
+        self,
+        model: DisplacementModel,
+        use_stages: bool,
+        append_release_stage: bool,
+        shift: float,
+        scale: float = 1.0,
+        n_bolts: int = 3,
+    ):
+        # Avoid zero-arg super() here: some TF/AutoGraph versions may attempt to
+        # convert __init__ and fail to resolve the implicit __class__ cell.
+        tf.Module.__init__(self, name="pinn_saved_model")
+        # 1. 显式追踪子模块 (关键修复)
+        # 将 DisplacementModel 的核心子层挂载到 self 上，确保 TF 能追踪到变量
+        self.encoder = model.encoder
+        self.field = model.field
+        
+        # 2. 保留原始模型的引用 (用于调用 u_fn)
+        # 注意：直接用 self._model.u_fn 可能会导致追踪路径断裂
+        # 我们需要确保 u_fn 使用的 encoder/field 就是上面挂载的这两个
+        self._model = model
+
+        self._use_stages = bool(use_stages)
+        self._append_release_stage = bool(append_release_stage)
+        self._shift = tf.constant(shift, dtype=tf.float32)
+        self._scale = tf.constant(scale, dtype=tf.float32)
+        self._n_bolts = int(max(1, n_bolts))
+
+    @tf.function(
+        input_signature=[
+            tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="x"),
+            tf.TensorSpec(shape=[None], dtype=tf.float32, name="p"),
+            tf.TensorSpec(shape=[None], dtype=tf.int32, name="order"),
+        ]
+    )
+    def run(self, x, p, order):
+        # 准备参数
+        params = self._prepare_params(p, order)
+        
+        # 调用模型的前向传播
+        # 由于 self._model.encoder 就是 self.encoder，变量是共享且被追踪的
+        return self._model.u_fn(x, params)
+
+    def _prepare_params(self, P, order):
+        # 确保 P 是 1D
+        P = tf.reshape(P, (self._n_bolts,))
+        
+        # 如果不启用分阶段，直接返回 P
+        if not self._use_stages:
+            return {"P": P}
+            
+        # 归一化顺序
+        order = self._normalize_order(order)
+        
+        # 构建阶段张量 (包含 P_hat 特征)
+        stage_P, stage_feat = self._build_stage_tensors(P, order)
+        
+        # 返回最后一个阶段的数据
+        return {"P": stage_P[-1], "P_hat": stage_feat[-1]}
+
+    def _normalize_order(self, order):
+        order = tf.reshape(order, (self._n_bolts,))
+        default = tf.range(self._n_bolts, dtype=tf.int32)
+        
+        # 检查是否全部 >= 0
+        cond = tf.reduce_all(order >= 0)
+        order = tf.where(cond, order, default)
+        
+        # 检查是否需要从 1-based 转 0-based
+        minv = tf.reduce_min(order)
+        maxv = tf.reduce_max(order)
+
+        def _one_based():
+            return order - 1
+
+        order = tf.cond(
+            tf.logical_and(tf.greater_equal(minv, 1), tf.less_equal(maxv, self._n_bolts)),
+            _one_based,
+            lambda: order,
+        )
+        return order
+
+    def _build_stage_tensors(self, P, order):
+        stage_count_bolts = self._n_bolts
+        stage_count_total = stage_count_bolts + (1 if self._append_release_stage else 0)
+        cumulative = tf.zeros_like(P)
+        mask = tf.zeros_like(P)
+        
+        # 使用 TensorArray 动态构建序列
+        loads_ta = tf.TensorArray(tf.float32, size=stage_count_bolts)
+        masks_ta = tf.TensorArray(tf.float32, size=stage_count_bolts)
+        last_ta = tf.TensorArray(tf.float32, size=stage_count_bolts)
+
+        def body(i, cum, mask_vec, loads, masks, lasts):
+            # 获取当前步骤要拧的螺栓索引
+            bolt = tf.gather(order, i)
+            bolt = tf.clip_by_value(bolt, 0, self._n_bolts - 1)
+            
+            # 获取该螺栓的力
+            load_val = tf.gather(P, bolt)
+            idx = tf.reshape(bolt, (1, 1))
+            
+            # 更新累积载荷 (cumulative)
+            cum = tf.tensor_scatter_nd_update(cum, idx, tf.reshape(load_val, (1,)))
+            
+            # 更新掩码 (mask)
+            mask_vec = tf.tensor_scatter_nd_update(
+                mask_vec, idx, tf.ones((1,), dtype=tf.float32)
+            )
+            
+            # 记录到 Array
+            loads = loads.write(i, cum)
+            masks = masks.write(i, mask_vec)
+            
+            # 构建 last_active (当前操作的螺栓)
+            last_vec = tf.zeros_like(P)
+            last_vec = tf.tensor_scatter_nd_update(
+                last_vec, idx, tf.ones((1,), dtype=tf.float32)
+            )
+            lasts = lasts.write(i, last_vec)
+            
+            return i + 1, cum, mask_vec, loads, masks, lasts
+
+        _, cumulative, mask, loads_ta, masks_ta, last_ta = tf.while_loop(
+            lambda i, *_: tf.less(i, stage_count_bolts),
+            body,
+            (0, cumulative, mask, loads_ta, masks_ta, last_ta),
+        )
+
+        stage_P = loads_ta.stack()
+        stage_masks = masks_ta.stack()
+        stage_last = last_ta.stack()
+
+        if self._append_release_stage:
+            # Final post-tightening stage: all bolts locked, no active force control.
+            stage_P = tf.concat([stage_P, tf.expand_dims(cumulative, axis=0)], axis=0)
+            stage_masks = tf.concat([stage_masks, tf.expand_dims(mask, axis=0)], axis=0)
+            stage_last = tf.concat(
+                [stage_last, tf.expand_dims(tf.zeros_like(P), axis=0)], axis=0
+            )
+
+        # 构建 Rank 矩阵
+        indices = tf.reshape(order, (-1, 1))
+        ranks = tf.cast(tf.range(stage_count_bolts), tf.float32)
+        rank_vec = tf.tensor_scatter_nd_update(
+            tf.zeros((self._n_bolts,), tf.float32), indices, ranks
+        )
+        if stage_count_bolts > 1:
+            rank_vec = rank_vec / tf.cast(stage_count_bolts - 1, tf.float32)
+        else:
+            rank_vec = tf.zeros_like(rank_vec)
+
+        # 拼接最终特征 P_hat
+        feats_ta = tf.TensorArray(tf.float32, size=stage_count_total)
+        for i in range(stage_count_total):
+            # 归一化 P
+            norm = (stage_P[i] - self._shift) / self._scale
+            # 拼接: [NormP, Mask, Last, Rank]
+            feat = tf.concat([norm, stage_masks[i], stage_last[i], rank_vec], axis=0)
+            feats_ta = feats_ta.write(i, feat)
+
+        stage_feat = feats_ta.stack()
+        return stage_P, stage_feat
