@@ -321,10 +321,10 @@ output_config:
   viz_plot_stages: true
   viz_samples_after_train: 1
   viz_use_shape_function_interp: true   # 启用形函数插值，让镜面云图更光滑
-  viz_surface_source: "part_top"
+  viz_surface_source: "surface"
   viz_refine_subdivisions: 2            # 细分以平滑
   viz_diagnose_blanks: true             # 启用空白诊断
-  viz_auto_fill_blanks: true            # 自动填充小空洞
+  viz_auto_fill_blanks: false           # 保留真实孔洞（环形镜面中心孔不应被填充）
   viz_draw_wireframe: false             # 不显示网格线
   viz_write_surface_mesh: true
 # ------------------------------------------------------------

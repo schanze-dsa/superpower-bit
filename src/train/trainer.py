@@ -258,7 +258,7 @@ class TrainerConfig:
     viz_units: str = "mm"
     viz_draw_wireframe: bool = False        # 关闭三角网格叠加，避免出现“双层网格”感
     viz_surface_enabled: bool = True        # 是否渲染单一镜面云图
-    viz_surface_source: str = "part_top"    # "surface" 使用 INP 表面；"part_top" 优先用零件外表面上表面
+    viz_surface_source: str = "surface"     # 默认按原始表面导出，避免重建外表面导致孔洞被填平
     viz_write_data: bool = True             # export displacement samples next to figure
     viz_write_surface_mesh: bool = False    # export reconstructed FE surface mesh next to figure
     viz_plot_full_structure: bool = False   # 导出全装配（或指定零件）的位移云图
