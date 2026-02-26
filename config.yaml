@@ -119,7 +119,7 @@ nuts:
 preload_staging:
   mode: force_then_lock
   enabled: true              # 启用分阶段加载 -> PINN 输入包含顺序信息
-  randomize_order: false     # 固定顺序
+  randomize_order: true      # 随机顺序（覆盖全排列）
   repeat: 1                  # 固定 case
   shuffle: false             # 若提供 sequence 列表，是否在 epoch 间随机打乱条目
   jitter: 0.0                # 顺序列表在训练时叠加的 ±jitter 噪声（N）
@@ -129,10 +129,9 @@ preload_staging:
   #     order:  [1, 3, 2]    # 顺序字段支持 1-based 或 0-based
 
 preload_use_stages: true
-preload_randomize_order: false
+preload_randomize_order: true
 preload_sequence:
   - values: [20.0, 20.0, 20.0]
-    order: [1, 2, 3]
 preload_sequence_repeat: 1
 preload_sequence_shuffle: false
 preload_sequence_jitter: 0.0
@@ -295,13 +294,14 @@ loss_config:
 # 关键修复：降低摩擦惩罚系数k_t以匹配弹性能量scale
 # 当前问题：Ect=2.6e8远大于Eint=2.5e5，导致梯度NaN
 friction_config:
-  enabled: false
+  enabled: true
   k_t: 0.0            # 关闭切向惩罚刚度
   mu_t: 1.0e3         # 保留数值稳定系数（实际不会起作用）
-  mu_f: 0.0           # 关闭库仑摩擦
+  mu_f: 0.3           # 启用库仑摩擦
   use_smooth_friction: false  # 关闭摩擦平滑路径
   use_delta_st_friction: false
-  smooth_to_strict: false
+  smooth_to_strict: true
+  off_fraction: 0.10
   smooth_fraction: 0.3
   smooth_steps: 300
   blend_steps: 200
@@ -318,6 +318,8 @@ normal_config:
 output_config:
   save_path: './results'
   visualize: true
+  viz_plot_stages: true
+  viz_samples_after_train: 1
   viz_use_shape_function_interp: true   # 启用形函数插值，让镜面云图更光滑
   viz_surface_source: "part_top"
   viz_refine_subdivisions: 2            # 细分以平滑

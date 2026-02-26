@@ -338,6 +338,12 @@ def _prepare_config_with_autoguess():
     output_cfg = cfg_yaml.get("output_config", {}) or {}
     if "save_path" in output_cfg:
         cfg.out_dir = str(output_cfg["save_path"])
+    if "viz_samples_after_train" in output_cfg:
+        cfg.viz_samples_after_train = int(output_cfg["viz_samples_after_train"])
+    if "viz_plot_stages" in output_cfg:
+        cfg.viz_plot_stages = bool(output_cfg["viz_plot_stages"])
+    if "viz_compare_cases" in output_cfg:
+        cfg.viz_compare_cases = bool(output_cfg["viz_compare_cases"])
 
     tight_cfg = cfg_yaml.get("tightening_config", {}) or {}
     if "alpha" in tight_cfg:

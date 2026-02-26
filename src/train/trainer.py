@@ -1102,7 +1102,11 @@ class Trainer:
                 self._preload_current_order = (
                     None if base_order is None else base_order.copy()
                 )
+                if self.cfg.preload_randomize_order:
+                    self._preload_current_order = None
 
+            if self.cfg.preload_randomize_order:
+                current_order = None
             self._last_preload_order = None if current_order is None else current_order.copy()
             return target.astype(np.float32)
 
@@ -1123,7 +1127,7 @@ class Trainer:
 
                 if self.cfg.preload_use_stages:
                     if self.cfg.preload_randomize_order:
-                        self._preload_current_order = np.random.permutation(nb).astype(np.int32)
+                        self._preload_current_order = None
                     else:
                         self._preload_current_order = np.arange(nb, dtype=np.int32)
                 else:
@@ -1141,6 +1145,8 @@ class Trainer:
                 self._preload_current_target = None
                 self._preload_current_order = None
 
+            if self.cfg.preload_randomize_order:
+                current_order = None
             self._last_preload_order = None if current_order is None else current_order.copy()
             return target.astype(np.float32)
 
@@ -1992,10 +1998,6 @@ class Trainer:
 
     def _resolve_friction_mode_for_step(self, step: int) -> str:
         if not bool(getattr(self.cfg, "friction_smooth_schedule", False)):
-            return "strict"
-
-        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
-        if loss_mode in {"residual", "residual_only", "res"}:
             return "strict"
 
         off_steps, smooth_steps, blend_steps = self._resolve_friction_schedule_windows()
